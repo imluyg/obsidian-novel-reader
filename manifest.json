@@ -1,7 +1,7 @@
 {
   "id": "novel-reader",
   "name": "Novel Reader",
-  "version": "0.6.0",
+  "version": "0.1.0",
   "minAppVersion": "1.4.0",
   "description": "沉浸式小说阅读器，移动端优先设计（横向分页、进度锚点、护眼主题）。",
   "author": "imluyg",
