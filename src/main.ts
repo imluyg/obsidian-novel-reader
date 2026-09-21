@@ -30,6 +30,7 @@ export interface ReaderSettings {
   fontSize: number;
   lineHeight: number;
   theme: 'auto' | 'sepia' | 'dark';
+  immersive: boolean;
 }
 
 export interface BookProgress {
@@ -37,16 +38,22 @@ export interface BookProgress {
   percent: number;
 }
 
+export interface BookConfig {
+  files: string[];
+}
+
 export interface PluginData {
   settings: ReaderSettings;
   lastBook: string | null;
   books: Record<string, BookProgress>;
+  bookConfig: Record<string, BookConfig>;
 }
 
 const DEFAULTS: PluginData = {
-  settings: { fontSize: 17, lineHeight: 1.9, theme: 'auto' },
+  settings: { fontSize: 17, lineHeight: 1.9, theme: 'auto', immersive: true },
   lastBook: null,
   books: {},
+  bookConfig: {},
 };
 
 /* ---------------- 插件入口 ---------------- */
@@ -61,6 +68,7 @@ export default class NovelReaderPlugin extends Plugin {
       settings: { ...DEFAULTS.settings, ...((loaded && loaded.settings) || {}) },
       lastBook: (loaded && loaded.lastBook) || null,
       books: (loaded && loaded.books) || {},
+      bookConfig: (loaded && loaded.bookConfig) || {},
     };
 
     this.registerView(NOVEL_READER_VIEW_TYPE, (leaf: WorkspaceLeaf) => {
@@ -206,6 +214,23 @@ function naturalCompare(a: string, b: string): number {
   return as.length - bs.length;
 }
 
+function touchDistance(a: Touch, b: Touch): number {
+  const dx = a.clientX - b.clientX;
+  const dy = a.clientY - b.clientY;
+  return Math.sqrt(dx * dx + dy * dy);
+}
+
+/** 章节名启发式：用于文件夹书首次打开时的默认勾选。无 lookbehind。 */
+function chapterLike(name: string): boolean {
+  if (/第.{0,4}[章節节卷回部集]/.test(name)) {
+    return true;
+  }
+  if (/^\d+([._、\-\s]|\b)/.test(name)) {
+    return true;
+  }
+  return /chapter/i.test(name);
+}
+
 /* ---------------- 阅读视图 ---------------- */
 
 type BookSource =
@@ -232,6 +257,13 @@ export class NovelReaderView extends ItemView {
   private pageCount = 1;
   private ro: ResizeObserver | null = null;
   private scrollRaf = 0;
+  private touchX = 0;
+  private touchY = 0;
+  private touchT = 0;
+  private pinchDist = 0;
+  private pinchFont = 0;
+  private suppressClick = false;
+  private pinchRaf = 0;
 
   constructor(leaf: WorkspaceLeaf, plugin: NovelReaderPlugin) {
     super(leaf);
@@ -304,6 +336,7 @@ export class NovelReaderView extends ItemView {
 
   public async onClose(): Promise<void> {
     this.saveProgressNow();
+    document.body.removeClass('nr-immersive');
     if (this.ro) {
       this.ro.disconnect();
       this.ro = null;
@@ -312,6 +345,10 @@ export class NovelReaderView extends ItemView {
       window.cancelAnimationFrame(this.scrollRaf);
       this.scrollRaf = 0;
     }
+    if (this.pinchRaf) {
+      window.cancelAnimationFrame(this.pinchRaf);
+      this.pinchRaf = 0;
+    }
   }
 
   public async openSource(src: BookSource): Promise<void> {
@@ -319,11 +356,35 @@ export class NovelReaderView extends ItemView {
     this.plugin.data.lastBook = this.sourceKey();
     this.plugin.saveSoon();
 
+    if (src.kind === 'folder') {
+      const all = listChapterFiles(src.folder);
+      if (all.length === 0) {
+        new Notice('该文件夹没有 Markdown 文件');
+        this.showEmptyState();
+        return;
+      }
+      const cfg = this.plugin.data.bookConfig[src.folder.path];
+      let files: TFile[];
+      if (cfg && cfg.files.length > 0) {
+        const wanted = new Set(cfg.files);
+        files = all.filter((f) => wanted.has(f.name));
+      } else {
+        files = await pickChapters(this.app, src.folder, all);
+        if (files.length === 0) {
+          this.showEmptyState();
+          return;
+        }
+        this.plugin.data.bookConfig[src.folder.path] = { files: files.map((f) => f.name) };
+        this.plugin.saveSoon();
+      }
+      this.chapterFiles = files;
+    } else {
+      this.chapterFiles = [src.file];
+    }
+
     this.contentEl.empty();
     this.contentEl.addClass('novel-reader');
     this.buildShell();
-
-    this.chapterFiles = src.kind === 'file' ? [src.file] : listChapterFiles(src.folder);
 
     this.cidEls = [];
     let cid = 0;
@@ -338,6 +399,7 @@ export class NovelReaderView extends ItemView {
     }
 
     this.applySettings();
+    this.applyImmersive();
     this.ro = new ResizeObserver(() => {
       this.relayout(this.currentAnchor());
     });
@@ -368,6 +430,10 @@ export class NovelReaderView extends ItemView {
 
     const overlay = this.contentEl.createDiv({ cls: 'nr-overlay' });
     this.registerDomEvent(overlay, 'click', (evt: MouseEvent) => {
+      if (this.suppressClick) {
+        this.suppressClick = false;
+        return;
+      }
       const rect = overlay.getBoundingClientRect();
       const x = evt.clientX - rect.left;
       if (x < rect.width * 0.25) {
@@ -376,6 +442,85 @@ export class NovelReaderView extends ItemView {
         this.turnPage(1);
       } else {
         this.toggleSheet();
+      }
+    });
+
+    // 滑动翻页（单指横滑）+ 捏合缩放（双指）
+    this.registerDomEvent(
+      overlay,
+      'touchstart',
+      (evt: TouchEvent) => {
+        if (evt.touches.length === 1) {
+          this.touchX = evt.touches[0].clientX;
+          this.touchY = evt.touches[0].clientY;
+          this.touchT = Date.now();
+        } else if (evt.touches.length === 2) {
+          this.pinchDist = touchDistance(evt.touches[0], evt.touches[1]);
+          this.pinchFont = this.plugin.data.settings.fontSize;
+        }
+      },
+      { passive: true }
+    );
+    this.registerDomEvent(
+      overlay,
+      'touchmove',
+      (evt: TouchEvent) => {
+        if (evt.touches.length === 2 && this.pinchDist > 0) {
+          evt.preventDefault();
+          const dist = touchDistance(evt.touches[0], evt.touches[1]);
+          const next = Math.min(
+            FONT_MAX,
+            Math.max(FONT_MIN, Math.round((this.pinchFont * dist) / this.pinchDist))
+          );
+          this.suppressClick = true;
+          this.applyFontSizeLive(next);
+        }
+      },
+      { passive: false }
+    );
+    this.registerDomEvent(
+      overlay,
+      'touchend',
+      (evt: TouchEvent) => {
+        if (evt.touches.length === 0 && this.pinchDist > 0) {
+          this.pinchDist = 0;
+          this.plugin.saveSoon();
+          return;
+        }
+        if (evt.changedTouches.length === 1 && this.touchT > 0) {
+          const dx = evt.changedTouches[0].clientX - this.touchX;
+          const dy = evt.changedTouches[0].clientY - this.touchY;
+          const dt = Date.now() - this.touchT;
+          this.touchT = 0;
+          if (dt < 500 && Math.abs(dx) > 50 && Math.abs(dx) > Math.abs(dy) * 1.5) {
+            this.suppressClick = true;
+            this.turnPage(dx < 0 ? 1 : -1);
+          }
+        }
+      },
+      { passive: true }
+    );
+
+    // 桌面端触控板横滑 / 键盘翻页
+    this.registerDomEvent(
+      overlay,
+      'wheel',
+      (evt: WheelEvent) => {
+        if (Math.abs(evt.deltaX) > Math.abs(evt.deltaY)) {
+          evt.preventDefault();
+          this.turnPage(evt.deltaX > 0 ? 1 : -1);
+        }
+      },
+      { passive: false }
+    );
+    this.containerEl.tabIndex = 0;
+    this.registerDomEvent(this.containerEl, 'keydown', (evt: KeyboardEvent) => {
+      if (evt.key === 'ArrowRight' || evt.key === 'PageDown' || evt.key === ' ') {
+        evt.preventDefault();
+        this.turnPage(1);
+      } else if (evt.key === 'ArrowLeft' || evt.key === 'PageUp') {
+        evt.preventDefault();
+        this.turnPage(-1);
       }
     });
 
@@ -412,7 +557,9 @@ export class NovelReaderView extends ItemView {
     mkBtn('行距−', () => this.changeLineHeight(-0.1));
     mkBtn('行距+', () => this.changeLineHeight(0.1));
     this.themeBtnEl = mkBtn(this.themeLabel(), () => this.cycleTheme());
+    mkBtn(this.immersiveLabel(), () => this.toggleImmersive());
     mkBtn('目录', () => this.openToc());
+    mkBtn('章节', () => this.repickChapters());
     mkBtn('换书', () => {
       this.toggleSheet(false);
       this.plugin.openPicker(this);
@@ -432,6 +579,23 @@ export class NovelReaderView extends ItemView {
     s.fontSize = Math.min(FONT_MAX, Math.max(FONT_MIN, s.fontSize + delta));
     this.plugin.saveSoon();
     this.reflow();
+  }
+
+  /** 捏合过程中实时应用字号（rAF 节流重排，结束时机由 touchend 落盘） */
+  private applyFontSizeLive(size: number): void {
+    const s = this.plugin.data.settings;
+    if (s.fontSize === size) {
+      return;
+    }
+    s.fontSize = size;
+    this.contentEl.style.setProperty('--nr-font', `${size}px`);
+    if (this.pinchRaf) {
+      window.cancelAnimationFrame(this.pinchRaf);
+    }
+    this.pinchRaf = window.requestAnimationFrame(() => {
+      this.pinchRaf = 0;
+      this.reflow();
+    });
   }
 
   private changeLineHeight(delta: number): void {
@@ -455,6 +619,27 @@ export class NovelReaderView extends ItemView {
   private themeLabel(): string {
     const t = this.plugin.data.settings.theme;
     return t === 'auto' ? '跟随主题' : t === 'sepia' ? '米色' : '暗黑';
+  }
+
+  private immersiveLabel(): string {
+    return this.plugin.data.settings.immersive ? '沉浸开' : '沉浸关';
+  }
+
+  private toggleImmersive(): void {
+    const s = this.plugin.data.settings;
+    s.immersive = !s.immersive;
+    this.plugin.saveSoon();
+    this.applyImmersive();
+    const btns = this.sheetEl ? Array.from(this.sheetEl.querySelectorAll('.nr-btn')) : [];
+    for (const btn of btns) {
+      if (btn.getText() === '沉浸开' || btn.getText() === '沉浸关') {
+        btn.setText(this.immersiveLabel());
+      }
+    }
+  }
+
+  private applyImmersive(): void {
+    document.body.toggleClass('nr-immersive', this.plugin.data.settings.immersive && !!this.source);
   }
 
   private applySettings(): void {
@@ -619,11 +804,25 @@ export class NovelReaderView extends ItemView {
     this.viewportEl.scrollTo({ left: Math.max(0, col) * this.stride(), behavior: 'smooth' });
   }
 
+  /** 文件夹书重新勾选章节 */
+  private repickChapters(): void {
+    if (!this.source || this.source.kind !== 'folder') {
+      new Notice('只有文件夹书可以重新选择章节');
+      return;
+    }
+    const folder = this.source.folder;
+    delete this.plugin.data.bookConfig[folder.path];
+    this.plugin.saveSoon();
+    this.toggleSheet(false);
+    void this.openSource({ kind: 'folder', folder });
+  }
+
   private showEmptyState(): void {
     this.source = null;
     this.chapterFiles = [];
     this.cidEls = [];
     this.pageCount = 1;
+    document.body.removeClass('nr-immersive');
     if (this.ro) {
       this.ro.disconnect();
       this.ro = null;
@@ -645,6 +844,47 @@ function listChapterFiles(folder: TFolder): TFile[] {
     (c): c is TFile => c instanceof TFile && c.extension === 'md'
   );
   return files.sort((a, b) => naturalCompare(a.name, b.name));
+}
+
+/** 首次打开文件夹书：让用户勾选哪些文件算章节。 */
+function pickChapters(app: App, folder: TFolder, files: TFile[]): Promise<TFile[]> {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (picked: TFile[]): void => {
+      if (!done) {
+        done = true;
+        resolve(picked);
+      }
+    };
+    const modal = new Modal(app);
+    modal.titleEl.setText(`选择《${folder.name}》的章节`);
+    const listEl = modal.contentEl.createDiv({ cls: 'nr-pick-list' });
+    const checks: HTMLInputElement[] = [];
+    for (const f of files) {
+      const row = listEl.createDiv({ cls: 'nr-pick-item' });
+      const cb = row.createEl('input', { type: 'checkbox' });
+      cb.checked = chapterLike(f.name);
+      checks.push(cb);
+      row.createSpan({ text: f.name });
+    }
+    const actions = modal.contentEl.createDiv({ cls: 'nr-pick-actions' });
+    const allBtn = actions.createEl('button', { cls: 'nr-btn', text: '全选' });
+    allBtn.onclick = () => {
+      checks.forEach((c) => (c.checked = true));
+    };
+    const noneBtn = actions.createEl('button', { cls: 'nr-btn', text: '全不选' });
+    noneBtn.onclick = () => {
+      checks.forEach((c) => (c.checked = false));
+    };
+    const okBtn = actions.createEl('button', { cls: 'nr-btn nr-btn-primary', text: '开始阅读' });
+    okBtn.onclick = () => {
+      modal.close();
+    };
+    modal.onClose = () => {
+      finish(files.filter((_, i) => checks[i].checked));
+    };
+    modal.open();
+  });
 }
 
 /* ---------------- 选书与目录弹窗 ---------------- */

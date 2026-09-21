@@ -154,6 +154,47 @@
 .nr-toc-l3 { padding-left: 42px; }
 .nr-toc-l4 { padding-left: 58px; }
 
+/* ---------- 沉浸模式：隐藏 Obsidian 标题栏与移动端导航 ---------- */
+body.nr-immersive .view-header {
+  display: none;
+}
+body.nr-immersive .mobile-navbar,
+body.nr-immersive .mobile-toolbar {
+  display: none;
+}
+
+/* ---------- 章节选择弹窗 ---------- */
+.nr-pick-list {
+  max-height: 50vh;
+  overflow-y: auto;
+  margin: 8px 0;
+}
+.nr-pick-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.nr-pick-item:hover {
+  background: var(--background-modifier-hover);
+}
+.nr-pick-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+.nr-btn-primary {
+  background: var(--interactive-accent);
+  color: var(--text-on-accent);
+  border-color: var(--interactive-accent);
+}
+
 /* ---------- 空状态 ---------- */
 .novel-reader-empty {
   display: flex;
