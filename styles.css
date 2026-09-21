@@ -1,9 +1,160 @@
-/* Novel Reader — M0 基础排版（分页引擎与主题在 M1 引入） */
+/* Novel Reader — M1 分页阅读 */
 
 .novel-reader {
+  position: relative;
   height: 100%;
+  background: var(--background-primary);
+  color: var(--text-normal);
 }
 
+/* ---------- 主题 ---------- */
+.novel-reader.nr-sepia {
+  background: #f4ecd8;
+  color: #5b4a32;
+}
+.novel-reader.nr-dark {
+  background: #17171a;
+  color: #b6b6ba;
+}
+
+/* ---------- 分页视口 ---------- */
+.novel-reader-viewport {
+  height: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  overscroll-behavior: contain;
+  scrollbar-width: none;
+}
+.novel-reader-viewport::-webkit-scrollbar {
+  display: none;
+}
+
+.nr-page {
+  height: calc(100% - 24px);
+  margin: 12px 0;
+  column-gap: 48px;
+  column-fill: auto;
+  font-size: var(--nr-font, 17px);
+  line-height: var(--nr-lh, 1.9);
+}
+
+.nr-chapter {
+  padding: 0 20px;
+  break-inside: auto;
+}
+
+.nr-page p {
+  text-indent: 2em;
+  margin-block: 0.35em;
+  text-align: justify;
+}
+
+.nr-page h1,
+.nr-page h2,
+.nr-page h3,
+.nr-page h4,
+.nr-page h5,
+.nr-page h6 {
+  margin-block: 1em 0.5em;
+  font-weight: 500;
+}
+
+/* ---------- 点击分区覆盖层 ---------- */
+.nr-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 5;
+  cursor: pointer;
+}
+
+/* ---------- 状态栏 ---------- */
+.nr-status {
+  position: absolute;
+  bottom: 4px;
+  left: 0;
+  right: 0;
+  z-index: 6;
+  text-align: center;
+  font-size: 11px;
+  color: var(--text-faint);
+  pointer-events: none;
+}
+.novel-reader.nr-dark .nr-status,
+.novel-reader.nr-sepia .nr-status {
+  color: inherit;
+  opacity: 0.55;
+}
+
+/* ---------- 底部控制栏 ---------- */
+.nr-sheet {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 10;
+  display: none;
+  padding: 8px 10px calc(8px + env(safe-area-inset-bottom, 0px));
+  background: var(--background-secondary);
+  border-top: 1px solid var(--background-modifier-border);
+}
+.nr-sheet.nr-open {
+  display: block;
+}
+.novel-reader.nr-sepia .nr-sheet {
+  background: #ece1c8;
+  border-top-color: #d8cbae;
+}
+.novel-reader.nr-dark .nr-sheet {
+  background: #222226;
+  border-top-color: #333338;
+}
+
+.nr-sheet-row {
+  display: flex;
+  gap: 6px;
+  justify-content: center;
+  flex-wrap: wrap;
+}
+
+.nr-btn {
+  padding: 6px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  color: var(--text-normal);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+/* ---------- 目录弹窗 ---------- */
+.nr-toc {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+.nr-toc-item {
+  text-align: left;
+  padding: 6px 10px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-normal);
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.nr-toc-item:hover {
+  background: var(--background-modifier-hover);
+}
+.nr-toc-l1 { padding-left: 10px; }
+.nr-toc-l2 { padding-left: 26px; }
+.nr-toc-l3 { padding-left: 42px; }
+.nr-toc-l4 { padding-left: 58px; }
+
+/* ---------- 空状态 ---------- */
 .novel-reader-empty {
   display: flex;
   flex-direction: column;
@@ -13,39 +164,17 @@
   padding-top: 30vh;
   color: var(--text-muted);
 }
-
 .novel-reader-empty h2 {
   margin: 0;
   color: var(--text-normal);
   font-weight: 500;
 }
-
 .novel-reader-pick {
   margin-top: 8px;
   padding: 6px 18px;
-  border-radius: var(--radius-m);
+  border-radius: 8px;
+  border: 1px solid var(--background-modifier-border);
+  background: var(--background-primary);
+  color: var(--text-normal);
   cursor: pointer;
-}
-
-.novel-reader-content {
-  max-width: 680px;
-  margin: 0 auto;
-  padding: 14px 18px 48px;
-  font-size: var(--novel-font-size, 17px);
-  line-height: var(--novel-line-height, 1.9);
-}
-
-/* 小说正文排版：段首缩进，段间不留大空隙 */
-.novel-reader-content p {
-  text-indent: 2em;
-  margin-block: 0.35em;
-  text-align: justify;
-}
-
-.novel-reader-meta {
-  font-size: 0.8em;
-  color: var(--text-muted);
-  text-align: center;
-  margin-bottom: 12px;
-  text-indent: 0;
 }
