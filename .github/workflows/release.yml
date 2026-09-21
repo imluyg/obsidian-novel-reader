@@ -13,9 +13,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with:
-          # 要读 tag 的附注消息当 Release 正文，必须有 tag
-          fetch-tags: true
 
       - uses: actions/setup-node@v4
         with:
@@ -32,10 +29,11 @@ jobs:
       - name: Collect release notes
         id: notes
         run: |
-          # 发版说明写在 tag 附注里（git tag -a -m "…"）；没写就退回自动生成的 commit 列表
-          git tag -l --format='%(contents:body)' "$GITHUB_REF_NAME" > notes.md
-          if grep -q '[^[:space:]]' notes.md; then
-            echo "mode=tag" >> "$GITHUB_OUTPUT"
+          # 发版说明写在仓库根目录的 RELEASE_NOTES.md（发版前更新它）；
+          # 文件为空或不存在就退回自动生成的 commit 列表。
+          # 注意：别改成读 tag 附注——那需要 checkout 的 fetch-tags，实测会让 checkout 步骤失败。
+          if [ -s RELEASE_NOTES.md ]; then
+            echo "mode=file" >> "$GITHUB_OUTPUT"
           else
             echo "mode=auto" >> "$GITHUB_OUTPUT"
           fi
@@ -44,10 +42,10 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          if [ "${{ steps.notes.outputs.mode }}" = "tag" ]; then
+          if [ "${{ steps.notes.outputs.mode }}" = "file" ]; then
             gh release create "$GITHUB_REF_NAME" main.js manifest.json styles.css \
               --title "${GITHUB_REF_NAME#v}" \
-              --notes-file notes.md
+              --notes-file RELEASE_NOTES.md
           else
             gh release create "$GITHUB_REF_NAME" main.js manifest.json styles.css \
               --title "${GITHUB_REF_NAME#v}" \
