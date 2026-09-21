@@ -1,0 +1,51 @@
+/* Novel Reader — M0 基础排版（分页引擎与主题在 M1 引入） */
+
+.novel-reader {
+  height: 100%;
+}
+
+.novel-reader-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding-top: 30vh;
+  color: var(--text-muted);
+}
+
+.novel-reader-empty h2 {
+  margin: 0;
+  color: var(--text-normal);
+  font-weight: 500;
+}
+
+.novel-reader-pick {
+  margin-top: 8px;
+  padding: 6px 18px;
+  border-radius: var(--radius-m);
+  cursor: pointer;
+}
+
+.novel-reader-content {
+  max-width: 680px;
+  margin: 0 auto;
+  padding: 14px 18px 48px;
+  font-size: var(--novel-font-size, 17px);
+  line-height: var(--novel-line-height, 1.9);
+}
+
+/* 小说正文排版：段首缩进，段间不留大空隙 */
+.novel-reader-content p {
+  text-indent: 2em;
+  margin-block: 0.35em;
+  text-align: justify;
+}
+
+.novel-reader-meta {
+  font-size: 0.8em;
+  color: var(--text-muted);
+  text-align: center;
+  margin-bottom: 12px;
+  text-indent: 0;
+}
