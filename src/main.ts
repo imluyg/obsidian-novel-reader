@@ -355,6 +355,21 @@ export default class NovelReaderPlugin extends Plugin {
     });
 
     this.addCommand({
+      id: 'close-reader',
+      name: '关闭阅读器',
+      checkCallback: (checking: boolean): boolean => {
+        const view = this.getActiveReaderView();
+        if (!view) {
+          return false;
+        }
+        if (!checking) {
+          view.closeReader();
+        }
+        return true;
+      },
+    });
+
+    this.addCommand({
       id: 'toggle-shelf-star',
       name: '把当前书籍加入/移出书架',
       checkCallback: (checking: boolean): boolean => {
@@ -1340,6 +1355,12 @@ export class NovelReaderView extends ItemView {
         this.turnPage(-1);
       }
     });
+    // 切到别的笔记 / 切回来都要立刻同步沉浸状态（见 applyImmersive 的说明）
+    this.registerEvent(
+      this.app.workspace.on('active-leaf-change', () => {
+        this.applyImmersive();
+      })
+    );
     this.showEmptyState();
   }
 
@@ -1527,6 +1548,15 @@ export class NovelReaderView extends ItemView {
     this.viewportEl = this.contentEl.createDiv({ cls: 'novel-reader-viewport' });
     this.pageEl = this.viewportEl.createDiv({ cls: 'nr-page' });
 
+    // 沉浸模式下标题栏和移动端导航栏都被藏了，右上角留一个很淡的出口：
+    // 点它唤出操作栏（里面有「退出阅读器」和沉浸开关），免得人在手机里出不来
+    const exit = this.contentEl.createEl('button', { cls: 'nr-exit', text: '✕' });
+    exit.setAttribute('title', '唤出操作栏（可退出阅读器 / 关闭沉浸）');
+    this.registerDomEvent(exit, 'click', (evt: MouseEvent) => {
+      evt.stopPropagation();
+      this.toggleSheet(true);
+    });
+
     const overlay = this.contentEl.createDiv({ cls: 'nr-overlay' });
     this.registerDomEvent(overlay, 'click', (evt: MouseEvent) => {
       if (this.suppressClick) {
@@ -1661,6 +1691,7 @@ export class NovelReaderView extends ItemView {
     mkBtn('搜索', () => void this.openSearch());
     mkBtn('书架', () => this.openBookshelf());
     mkBtn('换书', () => this.plugin.openPicker(this));
+    mkBtn('退出阅读器', () => this.closeReader());
   }
 
   private toggleSheet(force?: boolean): void {
@@ -1782,8 +1813,28 @@ export class NovelReaderView extends ItemView {
     }
   }
 
-  private applyImmersive(): void {
-    document.body.toggleClass('nr-immersive', this.plugin.data.settings.immersive && !!this.source);
+  /**
+   * 沉浸模式只在**这个视图是当前活动视图**时才生效。
+   * 切到别的笔记必须立刻恢复正常界面，否则移动端的导航栏/工具栏一直是隐藏的，
+   * 人就困在阅读器里出不来了（0.3.1 及以前只在视图关闭时才摘掉 class）。
+   */
+  public applyImmersive(): void {
+    const on = this.plugin.data.settings.immersive && !!this.source && this.isActiveReader();
+    document.body.toggleClass('nr-immersive', on);
+  }
+
+  private isActiveReader(): boolean {
+    const leaf = this.app.workspace.activeLeaf;
+    return !!leaf && leaf.view === this;
+  }
+
+  /** 关闭阅读器这个视图：手机上的明确出口 */
+  public closeReader(): void {
+    this.toggleSheet(false);
+    const leaf = this.leaf;
+    if (leaf) {
+      leaf.detach();
+    }
   }
 
   private applyTheme(): void {

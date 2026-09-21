@@ -564,6 +564,32 @@ body.nr-immersive .mobile-toolbar {
   display: none;
 }
 
+/* 沉浸模式下标题栏和导航栏都被藏了，右上角留一个很淡的出口 */
+.nr-exit {
+  position: absolute;
+  top: calc(6px + env(safe-area-inset-top, 0px));
+  right: 8px;
+  z-index: 12;
+  display: none;
+  width: 30px;
+  height: 30px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1px solid var(--background-modifier-border);
+  background: transparent;
+  color: var(--text-faint);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.5;
+}
+body.nr-immersive .nr-exit {
+  display: block;
+}
+.nr-exit:hover {
+  opacity: 1;
+}
+
 /* ---------- 章节选择弹窗 ---------- */
 .nr-pick-list {
   max-height: 50vh;
