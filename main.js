@@ -1,6 +1,6 @@
 "use strict";
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.NovelReaderView = exports.NOVEL_READER_VIEW_TYPE = void 0;
+exports.BookshelfView = exports.NovelReaderView = exports.FINISHED_PERCENT = exports.NOVEL_READER_SHELF_VIEW_TYPE = exports.NOVEL_READER_VIEW_TYPE = void 0;
 /**
  * Novel Reader — M3
  * 分页：CSS multi-column（column-fill: auto + 固定高），横向滚动按列翻页。
@@ -10,6 +10,8 @@ exports.NovelReaderView = exports.NOVEL_READER_VIEW_TYPE = void 0;
  */
 const obsidian_1 = require("obsidian");
 exports.NOVEL_READER_VIEW_TYPE = 'novel-reader-view';
+/** 书架是独立视图：不打开阅读器也能直接进 */
+exports.NOVEL_READER_SHELF_VIEW_TYPE = 'novel-reader-shelf-view';
 /** 单文件大书无标题时，按此字数切虚拟章（在段落边界断开） */
 const CHUNK_SIZE = 8000;
 /** 单章字数上限：再长就在段落边界补切一刀，避免一章的 DOM 太大拖慢排版 */
@@ -25,6 +27,8 @@ const FONT_MIN = 12;
 const FONT_MAX = 30;
 const LH_MIN = 1.4;
 const LH_MAX = 2.6;
+/** 读到 95% 以上就算读完（overall 是按章节估算的，很难正好到 100） */
+exports.FINISHED_PERCENT = 95;
 const DEFAULTS = {
     settings: {
         fontSize: 17,
@@ -33,6 +37,7 @@ const DEFAULTS = {
         immersive: true,
         perBookTypography: true,
         deepBrowse: true,
+        shelfView: 'grid',
     },
     lastBook: null,
     books: {},
@@ -40,6 +45,7 @@ const DEFAULTS = {
     bookmarks: {},
     bookStyle: {},
     shelf: {},
+    shelfMeta: {},
 };
 /** 兼容旧版本（v0.3.0 及以前）的进度结构：缺 chapter 字段时兜底为第 0 章 */
 function normalizeProgress(raw) {
@@ -56,6 +62,8 @@ function normalizeProgress(raw) {
         percent: Math.min(1, Math.max(0, num(rec.percent, 0))),
         overall: Math.min(100, Math.max(0, num(rec.overall, 0))),
         updatedAt: typeof rec.updatedAt === 'number' && Number.isFinite(rec.updatedAt) ? rec.updatedAt : 0,
+        chapterTitle: typeof rec.chapterTitle === 'string' ? rec.chapterTitle : '',
+        chapterCount: Math.max(0, Math.floor(num(rec.chapterCount, 0))),
     };
 }
 /* ---------------- 插件入口 ---------------- */
@@ -76,6 +84,7 @@ class NovelReaderPlugin extends obsidian_1.Plugin {
             bookStyle: (loaded && loaded.bookStyle) || {},
             // 0.2.x 只有进度表，没有收藏表：老数据直接当空收藏表，书架行为保持不变
             shelf: (loaded && loaded.shelf) || {},
+            shelfMeta: (loaded && loaded.shelfMeta) || {},
         };
         // 把历史数据（可能缺 chapter 字段）统一规范化，避免老版本升级后定位异常
         for (const key of Object.keys(this.data.books)) {
@@ -89,6 +98,9 @@ class NovelReaderPlugin extends obsidian_1.Plugin {
         }
         this.registerView(exports.NOVEL_READER_VIEW_TYPE, (leaf) => {
             return new NovelReaderView(leaf, this);
+        });
+        this.registerView(exports.NOVEL_READER_SHELF_VIEW_TYPE, (leaf) => {
+            return new BookshelfView(leaf, this);
         });
         // 阅读器没打开时也要维护书籍数据：在文件树里改名/删掉一本书不该让进度凭空消失
         // （视图打开着的情形由视图自己处理，这里跳过，避免重复迁移）
@@ -131,6 +143,9 @@ class NovelReaderPlugin extends obsidian_1.Plugin {
         this.addRibbonIcon('book-open', '小说阅读器', () => {
             void this.openReader();
         });
+        this.addRibbonIcon('library', '小说书架', () => {
+            void this.openShelf();
+        });
         this.addCommand({
             id: 'open-reader',
             name: '打开阅读器',
@@ -152,18 +167,12 @@ class NovelReaderPlugin extends obsidian_1.Plugin {
                 return true;
             },
         });
+        // 书架是独立视图：不需要先打开阅读器，命令面板里随时能进
         this.addCommand({
             id: 'open-book-shelf',
             name: '打开书架',
-            checkCallback: (checking) => {
-                const view = this.getActiveReaderView();
-                if (!view) {
-                    return false;
-                }
-                if (!checking) {
-                    new BookshelfModal(this, view).open();
-                }
-                return true;
+            callback: () => {
+                void this.openShelf();
             },
         });
         this.addCommand({
@@ -215,36 +224,64 @@ class NovelReaderPlugin extends obsidian_1.Plugin {
             void this.saveData(this.data);
         }, 800);
     }
-    async openReader() {
+    /** 打开或复用阅读器视图（不自动选书），书架要打开某本书时用它 */
+    async ensureReaderView() {
         const { workspace } = this.app;
-        let leaf = null;
         const existing = workspace.getLeavesOfType(exports.NOVEL_READER_VIEW_TYPE);
-        if (existing.length > 0) {
-            leaf = existing[0];
-        }
-        else {
+        let leaf = existing.length > 0 ? existing[0] : null;
+        if (!leaf) {
             leaf = workspace.getLeaf(false);
-            await leaf.setViewState({
-                type: exports.NOVEL_READER_VIEW_TYPE,
-                active: true,
-            });
+            await leaf.setViewState({ type: exports.NOVEL_READER_VIEW_TYPE, active: true });
         }
         workspace.revealLeaf(leaf);
-        const view = leaf.view;
-        if (view instanceof NovelReaderView && !view.hasSource) {
-            const last = this.data.lastBook;
-            if (last) {
-                const af = this.app.vault.getAbstractFileByPath(last);
-                if (af instanceof obsidian_1.TFile) {
-                    await view.openSource({ kind: 'file', file: af });
-                    return;
-                }
-                if (af instanceof obsidian_1.TFolder) {
-                    await view.openSource({ kind: 'folder', folder: af });
-                    return;
-                }
+        return leaf.view instanceof NovelReaderView ? leaf.view : null;
+    }
+    /** 从书架打开一本书：阅读器没开就先开一个，再载入这本书 */
+    async openBook(src) {
+        const view = await this.ensureReaderView();
+        if (view) {
+            await view.openSource(src);
+        }
+    }
+    async openReader() {
+        const view = await this.ensureReaderView();
+        if (!view || view.hasSource) {
+            return;
+        }
+        const last = this.data.lastBook;
+        if (last) {
+            const af = this.app.vault.getAbstractFileByPath(last);
+            if (af instanceof obsidian_1.TFile) {
+                await view.openSource({ kind: 'file', file: af });
+                return;
             }
-            this.openPicker(view);
+            if (af instanceof obsidian_1.TFolder) {
+                await view.openSource({ kind: 'folder', folder: af });
+                return;
+            }
+        }
+        this.openPicker(view);
+    }
+    /** 打开独立书架视图（已经开着就直接切过去并刷新） */
+    async openShelf() {
+        const { workspace } = this.app;
+        const existing = workspace.getLeavesOfType(exports.NOVEL_READER_SHELF_VIEW_TYPE);
+        let leaf = existing.length > 0 ? existing[0] : null;
+        if (!leaf) {
+            leaf = workspace.getLeaf(false);
+            await leaf.setViewState({ type: exports.NOVEL_READER_SHELF_VIEW_TYPE, active: true });
+        }
+        workspace.revealLeaf(leaf);
+        if (leaf.view instanceof BookshelfView) {
+            leaf.view.refresh();
+        }
+    }
+    /** 书架视图可能开着多个，书籍数据变动后统一刷新 */
+    refreshShelfViews() {
+        for (const leaf of this.app.workspace.getLeavesOfType(exports.NOVEL_READER_SHELF_VIEW_TYPE)) {
+            if (leaf.view instanceof BookshelfView) {
+                leaf.view.refresh();
+            }
         }
     }
     openPicker(view) {
@@ -268,25 +305,84 @@ class NovelReaderPlugin extends obsidian_1.Plugin {
                 continue;
             }
             const af = this.app.vault.getAbstractFileByPath(key);
+            const meta = this.data.shelfMeta[key] || {};
+            const overall = progress ? progress.overall : 0;
             const base = {
                 key,
-                overall: progress ? progress.overall : 0,
+                overall,
                 updatedAt: Math.max(starredAt, progress ? progress.updatedAt : 0),
                 starred: starredAt > 0,
+                pinned: (meta.pin || 0) > 0,
+                chapterTitle: progress && progress.chapterTitle ? progress.chapterTitle : '',
+                chapterCount: progress && progress.chapterCount ? progress.chapterCount : 0,
+                bookmarks: (this.data.bookmarks[key] || []).length,
+                unread: !progress || (progress.overall === 0 && progress.updatedAt === 0),
+                finished: overall >= exports.FINISHED_PERCENT,
             };
             if (af instanceof obsidian_1.TFolder) {
                 entries.push({
                     ...base,
                     kind: 'folder',
-                    title: af.name,
+                    title: meta.alias || af.name,
+                    realTitle: af.name,
                     detail: `文件夹 · ${countMd(af)} 篇`,
                 });
             }
             else if (af instanceof obsidian_1.TFile) {
-                entries.push({ ...base, kind: 'file', title: af.basename, detail: '单文件' });
+                entries.push({
+                    ...base,
+                    kind: 'file',
+                    title: meta.alias || af.basename,
+                    realTitle: af.basename,
+                    detail: '单文件',
+                });
             }
         }
-        return entries.sort((a, b) => b.updatedAt - a.updatedAt);
+        // 置顶的书永远在最前，其余按最近活动倒序（具体排序键由书架界面决定）
+        return entries.sort((a, b) => {
+            if (a.pinned !== b.pinned) {
+                return a.pinned ? -1 : 1;
+            }
+            return b.updatedAt - a.updatedAt;
+        });
+    }
+    /** 书架附加信息（置顶 / 显示名），没设置过时返回空对象 */
+    shelfMetaOf(path) {
+        return this.data.shelfMeta[path] || {};
+    }
+    writeShelfMeta(path, patch) {
+        const current = this.data.shelfMeta[path] || {};
+        const next = { ...current, ...patch };
+        if (!next.alias) {
+            delete next.alias;
+        }
+        if (!next.pin) {
+            delete next.pin;
+        }
+        // 全空就整条删掉，别在数据里留下 {} 这种垃圾
+        if (next.alias === undefined && next.pin === undefined) {
+            delete this.data.shelfMeta[path];
+        }
+        else {
+            this.data.shelfMeta[path] = next;
+        }
+        this.saveSoon();
+    }
+    /** 给书起一个只在书架里生效的显示名，传空串表示恢复真实文件名 */
+    setBookAlias(path, alias) {
+        this.writeShelfMeta(path, { alias: alias.trim() });
+    }
+    /** 置顶开关，返回操作后的状态（true = 已置顶） */
+    togglePin(path) {
+        const current = this.data.shelfMeta[path];
+        const on = !(current && current.pin);
+        this.writeShelfMeta(path, { pin: on ? Date.now() : 0 });
+        return on;
+    }
+    /** 重置某本书的阅读进度（收藏、书签都保留） */
+    resetBookProgress(path) {
+        delete this.data.books[path];
+        this.saveSoon();
     }
     /** 收藏一本书：没读过也能上架 */
     addToShelf(path) {
@@ -321,6 +417,7 @@ class NovelReaderPlugin extends obsidian_1.Plugin {
             d.bookmarks,
             d.bookStyle,
             d.shelf,
+            d.shelfMeta,
         ];
         for (const store of stores) {
             for (const key of Object.keys(store)) {
@@ -352,6 +449,7 @@ class NovelReaderPlugin extends obsidian_1.Plugin {
         delete this.data.bookConfig[key];
         delete this.data.bookStyle[key];
         delete this.data.shelf[key];
+        delete this.data.shelfMeta[key];
         if (this.data.lastBook === key) {
             this.data.lastBook = null;
         }
@@ -382,6 +480,10 @@ class NovelReaderPlugin extends obsidian_1.Plugin {
         if (d.shelf[oldPath]) {
             d.shelf[newPath] = d.shelf[oldPath];
             delete d.shelf[oldPath];
+        }
+        if (d.shelfMeta[oldPath]) {
+            d.shelfMeta[newPath] = d.shelfMeta[oldPath];
+            delete d.shelfMeta[oldPath];
         }
         if (d.lastBook === oldPath) {
             d.lastBook = newPath;
@@ -1355,6 +1457,10 @@ class NovelReaderView extends obsidian_1.ItemView {
         const anchor = this.currentAnchor();
         anchor.overall = this.overallPercent();
         anchor.updatedAt = Date.now();
+        // 书架要显示「读到哪了」：章节标题与总章数一起记下来
+        const chapter = this.chapters[this.chapterIndex];
+        anchor.chapterTitle = chapter ? chapter.title : '';
+        anchor.chapterCount = this.chapters.length;
         this.plugin.data.books[this.sourceKey()] = anchor;
         this.plugin.saveSoon();
     }
@@ -1393,7 +1499,7 @@ class NovelReaderView extends obsidian_1.ItemView {
     }
     openBookshelf() {
         this.toggleSheet(false);
-        new BookshelfModal(this.plugin, this).open();
+        new BookshelfModal(this.plugin).open();
     }
     /** 取出某一章的正文：有整本缓存就按偏移量切片，否则读文件再切 */
     async chapterText(chapter) {
@@ -1714,6 +1820,7 @@ class ReaderSearchModal extends obsidian_1.FuzzySuggestModal {
         }
     }
 }
+/* ---------------- 书架 / 选书 / 搜索 ---------------- */
 /** 最后活动时间的人类可读形式，书架里比裸时间戳好用 */
 function formatRelative(ts) {
     const diff = Date.now() - ts;
@@ -1733,29 +1840,101 @@ function formatRelative(ts) {
     const pad = (n) => (n < 10 ? `0${n}` : String(n));
     return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
 }
-/** 书架：过滤 + 排序 + 进度条 + 收藏开关 + 浏览全库加书 */
-class BookshelfModal extends obsidian_1.Modal {
-    constructor(plugin, view) {
-        super(plugin.app);
+const SHELF_TABS = [
+    { id: 'all', label: '全部' },
+    { id: 'reading', label: '在读' },
+    { id: 'starred', label: '收藏' },
+    { id: 'unread', label: '未读' },
+    { id: 'finished', label: '读完' },
+];
+/** 封面色：按路径哈希出一个稳定色相，同一本书每次打开都同色 */
+function coverHue(key) {
+    let h = 0;
+    for (let i = 0; i < key.length; i++) {
+        h = (h * 31 + key.charCodeAt(i)) % 360;
+    }
+    return h;
+}
+/** 封面首字：西文取首字母大写，其他（中文等）取第一个字 */
+function coverLetter(title) {
+    const t = title.trim();
+    if (t.length === 0) {
+        return '书';
+    }
+    const ch = t.charAt(0);
+    return /[a-z]/i.test(ch) ? ch.toUpperCase() : ch;
+}
+/**
+ * 书架列表：网格/列表两种形态、分类标签、排序过滤、批量操作、详情面板。
+ * 阅读器里的书架弹窗和常驻书架视图共用这一份实现，行为始终一致。
+ */
+class ShelfList {
+    constructor(host, root) {
         this.entries = [];
         this.sort = 'recent';
+        this.tab = 'all';
         this.filter = '';
+        this.selecting = false;
+        this.selected = new Set();
         this.listEl = null;
         this.hintEl = null;
-        this.plugin = plugin;
-        this.view = view;
+        this.host = host;
+        this.root = root;
+        this.app = host.plugin.app;
+        // 上次用过的形态记在设置里，下次打开还是它
+        this.mode = host.plugin.data.settings.shelfView === 'list' ? 'list' : 'grid';
     }
-    onOpen() {
-        this.contentEl.addClass('nr-shelf');
-        this.titleEl.setText('书架');
-        this.entries = this.plugin.getShelf();
-        const bar = this.contentEl.createDiv({ cls: 'nr-shelf-toolbar' });
+    /** 重新取数据并整体重画（外部改动了书籍数据后调用） */
+    refresh() {
+        this.entries = this.host.plugin.getShelf();
+        this.render();
+    }
+    render() {
+        const root = this.root;
+        root.empty();
+        // root 由宿主创建并复用，重复 addClass 会让 class 越堆越长
+        if (!root.hasClass('nr-shelf')) {
+            root.addClass('nr-shelf');
+        }
+        if (this.entries.length === 0) {
+            this.renderEmpty(root);
+            return;
+        }
+        this.renderToolbar(root);
+        this.renderTabs(root);
+        if (this.selecting) {
+            this.renderSelectionBar(root);
+        }
+        this.hintEl = root.createDiv({ cls: 'nr-shelf-hint' });
+        this.listEl = root.createDiv({
+            cls: `nr-shelf-list${this.mode === 'grid' ? ' nr-shelf-grid' : ''}`,
+        });
+        this.renderList();
+        this.renderActions(root);
+    }
+    renderEmpty(parent) {
+        parent.createDiv({
+            cls: 'nr-shelf-hint',
+            text: '书架还是空的，从下面浏览库添加一本书吧',
+        });
+        const actions = parent.createDiv({ cls: 'nr-shelf-actions' });
+        const btn = actions.createEl('button', {
+            cls: 'nr-btn nr-btn-primary',
+            text: '浏览全库添加书籍',
+        });
+        btn.onclick = () => {
+            new BookBrowserModal(this.host.plugin, () => this.refresh()).open();
+        };
+    }
+    renderToolbar(parent) {
+        const bar = parent.createDiv({ cls: 'nr-shelf-toolbar' });
         const input = bar.createEl('input', { type: 'search' });
         input.placeholder = '过滤书名或路径…';
-        // 精简版 obsidian.d.ts 里 Modal 没有 registerDomEvent；这些节点随弹窗一起销毁，不用手动解绑
+        input.value = this.filter;
+        // 精简版 obsidian.d.ts 的 Modal 没有 registerDomEvent；这些节点随容器重建一起销毁
         input.addEventListener('input', () => {
-            this.filter = input.value.trim().toLowerCase();
-            this.render();
+            this.filter = input.value.trim();
+            this.renderList();
         });
         const select = bar.createEl('select', { cls: 'nr-shelf-sort' });
         for (const opt of [
@@ -1765,43 +1944,179 @@ class BookshelfModal extends obsidian_1.Modal {
         ]) {
             select.createEl('option', { value: opt.value, text: opt.label });
         }
+        select.value = this.sort;
         select.addEventListener('change', () => {
             this.sort = select.value;
+            this.renderList();
+        });
+        const modeBtn = bar.createEl('button', {
+            cls: 'nr-btn nr-shelf-mode',
+            text: this.mode === 'grid' ? '列表' : '网格',
+        });
+        modeBtn.setAttribute('title', this.mode === 'grid' ? '切换成列表' : '切换成网格');
+        modeBtn.onclick = () => {
+            this.mode = this.mode === 'grid' ? 'list' : 'grid';
+            this.host.plugin.data.settings.shelfView = this.mode;
+            this.host.plugin.saveSoon();
             this.render();
-        });
-        this.hintEl = this.contentEl.createDiv({ cls: 'nr-shelf-hint' });
-        this.listEl = this.contentEl.createDiv({ cls: 'nr-shelf-list' });
-        this.render();
-        const actions = this.contentEl.createDiv({ cls: 'nr-shelf-actions' });
-        const browseBtn = actions.createEl('button', {
-            cls: 'nr-btn nr-btn-primary',
-            text: '浏览全库添加书籍',
-        });
-        browseBtn.onclick = () => {
-            const targetView = this.view;
-            this.close();
-            new BookBrowserModal(this.plugin, targetView).open();
         };
     }
-    /** 换排序 / 输入过滤 / 切收藏后重画列表 */
-    render() {
+    renderTabs(parent) {
+        const counts = this.counts();
+        const wrap = parent.createDiv({ cls: 'nr-shelf-tabs' });
+        for (const t of SHELF_TABS) {
+            const btn = wrap.createEl('button', {
+                cls: `nr-shelf-tab${this.tab === t.id ? ' nr-shelf-tab-on' : ''}`,
+                text: `${t.label} ${counts[t.id]}`,
+            });
+            btn.onclick = () => {
+                this.tab = t.id;
+                this.render();
+            };
+        }
+    }
+    counts() {
+        const c = {
+            all: 0,
+            reading: 0,
+            starred: 0,
+            unread: 0,
+            finished: 0,
+        };
+        for (const e of this.entries) {
+            c.all += 1;
+            if (e.starred) {
+                c.starred += 1;
+            }
+            if (e.finished) {
+                c.finished += 1;
+            }
+            else if (e.unread) {
+                c.unread += 1;
+            }
+            else {
+                c.reading += 1;
+            }
+        }
+        return c;
+    }
+    renderSelectionBar(parent) {
+        const bar = parent.createDiv({ cls: 'nr-shelf-selbar' });
+        bar.createSpan({ cls: 'nr-shelf-selcount', text: `已选 ${this.selected.size} 本` });
+        const mk = (label, cls, onClick) => {
+            const btn = bar.createEl('button', { cls: `nr-btn ${cls}`.trim(), text: label });
+            btn.onclick = onClick;
+        };
+        mk('全选', '', () => {
+            for (const e of this.shown()) {
+                this.selected.add(e.key);
+            }
+            this.render();
+        });
+        mk('清空', '', () => {
+            this.selected.clear();
+            this.render();
+        });
+        mk('收藏', '', () => this.bulkStar(true));
+        mk('取消收藏', '', () => this.bulkStar(false));
+        mk('移除', 'nr-btn-danger', () => this.bulkRemove());
+        mk('完成', '', () => {
+            this.selecting = false;
+            this.selected.clear();
+            this.render();
+        });
+    }
+    bulkStar(on) {
+        const plugin = this.host.plugin;
+        let n = 0;
+        for (const key of this.selected) {
+            if (plugin.isStarred(key) !== on) {
+                plugin.toggleShelf(key);
+                n += 1;
+            }
+        }
+        new obsidian_1.Notice(n > 0 ? `已${on ? '收藏' : '取消收藏'} ${n} 本` : '没有需要变动的书');
+        this.afterBulk();
+    }
+    bulkRemove() {
+        const keys = Array.from(this.selected);
+        if (keys.length === 0) {
+            new obsidian_1.Notice('还没选书');
+            return;
+        }
+        new ConfirmModal(this.app, '从书架移除', `移除选中的 ${keys.length} 本书的阅读记录、收藏、书签与章节配置？`, () => {
+            const plugin = this.host.plugin;
+            const view = plugin.getActiveReaderView();
+            for (const key of keys) {
+                plugin.removeFromShelf(key);
+                if (view && view.hasSource && view.sourceKey() === key) {
+                    view.closeSource();
+                }
+            }
+            new obsidian_1.Notice(`已移除 ${keys.length} 本`);
+            this.afterBulk();
+        }).open();
+    }
+    afterBulk() {
+        this.selected.clear();
+        this.selecting = false;
+        this.refresh();
+    }
+    renderList() {
         const list = this.listEl;
         const hint = this.hintEl;
         if (!list || !hint) {
             return;
         }
-        if (this.entries.length === 0) {
-            hint.setText('书架还是空的，从下面浏览库添加一本书吧');
+        const shown = this.shown();
+        list.empty();
+        if (shown.length === 0) {
+            hint.setText(this.filter.length > 0 || this.tab !== 'all'
+                ? '没有符合条件的书'
+                : '书架还是空的，从下面浏览库添加一本书吧');
             hint.style.display = '';
-            list.empty();
             return;
         }
-        const keyword = this.filter;
-        const shown = this.entries
-            .filter((e) => keyword.length === 0 ||
-            e.title.toLowerCase().includes(keyword) ||
-            e.key.toLowerCase().includes(keyword))
-            .sort((a, b) => {
+        hint.style.display = 'none';
+        const view = this.host.plugin.getActiveReaderView();
+        const currentKey = view && view.hasSource ? view.sourceKey() : '';
+        for (const entry of shown) {
+            const current = entry.key === currentKey;
+            if (this.mode === 'grid') {
+                this.renderCard(list, entry, current);
+            }
+            else {
+                this.renderRow(list, entry, current);
+            }
+        }
+    }
+    shown() {
+        const keyword = this.filter.toLowerCase();
+        const list = this.entries.filter((e) => {
+            if (this.tab === 'starred' && !e.starred) {
+                return false;
+            }
+            if (this.tab === 'unread' && !e.unread) {
+                return false;
+            }
+            if (this.tab === 'finished' && !e.finished) {
+                return false;
+            }
+            if (this.tab === 'reading' && (e.unread || e.finished)) {
+                return false;
+            }
+            if (keyword.length === 0) {
+                return true;
+            }
+            return (e.title.toLowerCase().includes(keyword) ||
+                e.realTitle.toLowerCase().includes(keyword) ||
+                e.key.toLowerCase().includes(keyword));
+        });
+        return list.sort((a, b) => {
+            // 置顶永远在最前
+            if (a.pinned !== b.pinned) {
+                return a.pinned ? -1 : 1;
+            }
             if (this.sort === 'title') {
                 return naturalCompare(a.title, b.title);
             }
@@ -1810,93 +2125,466 @@ class BookshelfModal extends obsidian_1.Modal {
             }
             return b.updatedAt - a.updatedAt;
         });
-        list.empty();
-        if (shown.length === 0) {
-            hint.setText('没有匹配的书');
-            hint.style.display = '';
-            return;
-        }
-        hint.style.display = 'none';
-        const currentKey = this.view.hasSource ? this.view.sourceKey() : null;
-        for (const entry of shown) {
-            this.renderRow(list, entry, entry.key === currentKey);
-        }
     }
+    /** 列表行：封面色块 + 书名 + 进度条 + 读到哪了 + 收藏/详情/移除 */
     renderRow(parent, entry, current) {
         const row = parent.createDiv({ cls: 'nr-shelf-item' });
         if (current) {
             row.addClass('nr-shelf-current');
         }
+        if (this.selected.has(entry.key)) {
+            row.addClass('nr-shelf-picked');
+        }
+        const box = row.createDiv({
+            cls: `nr-shelf-check${this.selecting ? ' nr-shelf-check-on' : ''}`,
+            text: this.selecting ? (this.selected.has(entry.key) ? '✓' : '') : '',
+        });
+        box.setAttribute('title', '选择');
+        box.addEventListener('click', (evt) => {
+            evt.stopPropagation();
+            this.toggleSelect(entry.key);
+        });
+        const cover = row.createDiv({ cls: 'nr-shelf-thumb' });
+        cover.style.background = coverGradient(entry.key);
+        cover.createDiv({ cls: 'nr-shelf-thumb-letter', text: coverLetter(entry.title) });
         const main = row.createDiv({ cls: 'nr-shelf-main' });
         main.createDiv({ cls: 'nr-shelf-title', text: entry.title });
         const bar = main.createDiv({ cls: 'nr-shelf-bar' });
         const fill = bar.createDiv({ cls: 'nr-shelf-bar-fill' });
         fill.style.width = `${Math.min(100, Math.max(0, entry.overall))}%`;
+        main.createDiv({ cls: 'nr-shelf-meta', text: this.metaText(entry, current) });
+        if (this.selecting) {
+            row.addEventListener('click', () => this.toggleSelect(entry.key));
+            return;
+        }
+        row.addEventListener('click', () => this.openEntry(entry));
+        this.mkIcon(row, entry.starred ? '★' : '☆', entry.starred ? '取消收藏' : '加入书架', (btn) => {
+            const on = this.host.plugin.toggleShelf(entry.key);
+            btn.setText(on ? '★' : '☆');
+            btn.toggleClass('nr-shelf-icon-on', on);
+            entry.starred = on;
+            new obsidian_1.Notice(on ? `已收藏《${entry.title}》` : `已取消收藏《${entry.title}》`);
+            this.refreshIfGone(entry);
+        });
+        this.mkIcon(row, 'ⓘ', '详情', () => this.openDetail(entry));
+        this.mkIcon(row, '✕', '从书架移除', () => this.removeOne(entry));
+    }
+    /** 网格卡片：竖排封面 + 书名 + 进度，右上角收藏、右下角详情 */
+    renderCard(parent, entry, current) {
+        const card = parent.createDiv({ cls: 'nr-shelf-card' });
+        if (current) {
+            card.addClass('nr-shelf-current');
+        }
+        if (this.selected.has(entry.key)) {
+            card.addClass('nr-shelf-picked');
+        }
+        const cover = card.createDiv({ cls: 'nr-shelf-cover' });
+        cover.style.background = coverGradient(entry.key);
+        cover.createDiv({ cls: 'nr-shelf-cover-letter', text: coverLetter(entry.title) });
+        const badges = cover.createDiv({ cls: 'nr-shelf-badges' });
+        if (entry.pinned) {
+            badges.createDiv({ cls: 'nr-shelf-badge', text: '顶' });
+        }
+        if (entry.starred) {
+            badges.createDiv({ cls: 'nr-shelf-badge', text: '★' });
+        }
+        if (current) {
+            badges.createDiv({ cls: 'nr-shelf-badge nr-shelf-badge-live', text: '在读' });
+        }
+        const box = cover.createDiv({
+            cls: `nr-shelf-check${this.selecting ? ' nr-shelf-check-on' : ''}`,
+            text: this.selecting ? (this.selected.has(entry.key) ? '✓' : '') : '',
+        });
+        box.addEventListener('click', (evt) => {
+            evt.stopPropagation();
+            this.toggleSelect(entry.key);
+        });
+        const body = card.createDiv({ cls: 'nr-shelf-card-body' });
+        body.createDiv({ cls: 'nr-shelf-card-title', text: entry.title });
+        body.createDiv({ cls: 'nr-shelf-card-meta', text: this.shortMeta(entry) });
+        const bar = body.createDiv({ cls: 'nr-shelf-bar' });
+        const fill = bar.createDiv({ cls: 'nr-shelf-bar-fill' });
+        fill.style.width = `${Math.min(100, Math.max(0, entry.overall))}%`;
+        if (this.selecting) {
+            card.addEventListener('click', () => this.toggleSelect(entry.key));
+            return;
+        }
+        card.addEventListener('click', () => this.openEntry(entry));
+        const tools = body.createDiv({ cls: 'nr-shelf-card-tools' });
+        this.mkIcon(tools, entry.starred ? '★' : '☆', entry.starred ? '取消收藏' : '加入书架', (btn) => {
+            const on = this.host.plugin.toggleShelf(entry.key);
+            btn.setText(on ? '★' : '☆');
+            btn.toggleClass('nr-shelf-icon-on', on);
+            entry.starred = on;
+            new obsidian_1.Notice(on ? `已收藏《${entry.title}》` : `已取消收藏《${entry.title}》`);
+            this.refreshIfGone(entry);
+        });
+        this.mkIcon(tools, 'ⓘ', '详情', () => this.openDetail(entry));
+    }
+    mkIcon(parent, text, title, onClick) {
+        const btn = parent.createEl('button', {
+            cls: `nr-btn nr-shelf-icon-btn${text === '★' ? ' nr-shelf-icon-on' : ''}`,
+            text,
+            title,
+        });
+        btn.addEventListener('click', (evt) => {
+            evt.stopPropagation();
+            onClick(btn);
+        });
+        return btn;
+    }
+    toggleSelect(key) {
+        if (!this.selecting) {
+            this.selecting = true;
+        }
+        if (this.selected.has(key)) {
+            this.selected.delete(key);
+        }
+        else {
+            this.selected.add(key);
+        }
+        this.render();
+    }
+    /** 取消收藏后，没真正读过的书就不该继续占着书架 */
+    refreshIfGone(entry) {
+        const progress = this.host.plugin.data.books[entry.key];
+        if (!entry.starred && (!progress || (progress.updatedAt === 0 && progress.overall === 0))) {
+            this.refresh();
+        }
+    }
+    metaText(entry, current) {
         const tags = [entry.detail, `已读 ${entry.overall}%`];
+        if (entry.chapterTitle) {
+            tags.push(entry.chapterCount > 0 ? `读到 ${entry.chapterTitle}` : `读到 ${entry.chapterTitle}`);
+        }
         if (entry.updatedAt > 0) {
             tags.push(formatRelative(entry.updatedAt));
+        }
+        if (entry.bookmarks > 0) {
+            tags.push(`${entry.bookmarks} 个书签`);
         }
         if (current) {
             tags.push('正在阅读');
         }
-        main.createDiv({ cls: 'nr-shelf-meta', text: tags.join(' · ') });
-        row.addEventListener('click', () => this.openEntry(entry));
-        const openBtn = row.createEl('button', { cls: 'nr-btn', text: '打开' });
-        openBtn.onclick = (evt) => {
-            evt.stopPropagation();
-            this.openEntry(entry);
-        };
-        const starBtn = row.createEl('button', {
-            cls: `nr-btn nr-btn-star${entry.starred ? ' nr-btn-star-on' : ''}`,
-            text: entry.starred ? '★' : '☆',
-        });
-        starBtn.setAttribute('title', entry.starred ? '取消收藏' : '加入书架');
-        starBtn.onclick = (evt) => {
-            evt.stopPropagation();
-            const on = this.plugin.toggleShelf(entry.key);
-            starBtn.setText(on ? '★' : '☆');
-            starBtn.toggleClass('nr-btn-star-on', on);
-            entry.starred = on;
-            new obsidian_1.Notice(on ? `已收藏《${entry.title}》` : `已取消收藏《${entry.title}》`);
-            // 取消收藏后，如果这本书其实没真正读过，就不该继续占着书架
-            const progress = this.plugin.data.books[entry.key];
-            if (!on && (!progress || (progress.updatedAt === 0 && progress.overall === 0))) {
-                this.entries = this.plugin.getShelf();
-                this.render();
+        if (entry.pinned) {
+            tags.push('置顶');
+        }
+        return tags.join(' · ');
+    }
+    shortMeta(entry) {
+        if (entry.unread) {
+            return '未读';
+        }
+        if (entry.finished) {
+            return '已读完';
+        }
+        return `${entry.overall}%`;
+    }
+    openDetail(entry) {
+        new BookDetailModal(this.host.plugin, entry, () => this.refresh()).open();
+    }
+    removeOne(entry) {
+        new ConfirmModal(this.app, '从书架移除', `移除《${entry.title}》的阅读记录、收藏、书签与章节配置？`, () => {
+            this.host.plugin.removeFromShelf(entry.key);
+            new obsidian_1.Notice(`已移除《${entry.title}》`);
+            const view = this.host.plugin.getActiveReaderView();
+            if (view && view.hasSource && view.sourceKey() === entry.key) {
+                view.closeSource();
             }
+            this.refresh();
+        }).open();
+    }
+    renderActions(parent) {
+        const actions = parent.createDiv({ cls: 'nr-shelf-actions' });
+        const batchBtn = actions.createEl('button', {
+            cls: 'nr-btn',
+            text: this.selecting ? '退出批量' : '批量',
+        });
+        batchBtn.onclick = () => {
+            this.selecting = !this.selecting;
+            this.selected.clear();
+            this.render();
         };
-        const delBtn = row.createEl('button', { cls: 'nr-btn nr-btn-danger', text: '移除' });
-        delBtn.onclick = (evt) => {
-            evt.stopPropagation();
-            new ConfirmModal(this.app, '从书架移除', `移除《${entry.title}》的阅读记录、收藏、书签与章节配置？`, () => {
-                this.plugin.removeFromShelf(entry.key);
-                new obsidian_1.Notice(`已移除《${entry.title}》`);
-                if (this.view.hasSource && this.view.sourceKey() === entry.key) {
-                    void this.view.closeSource();
-                }
-                this.entries = this.plugin.getShelf();
-                this.render();
-            }).open();
+        const browseBtn = actions.createEl('button', {
+            cls: 'nr-btn nr-btn-primary',
+            text: '浏览全库添加书籍',
+        });
+        browseBtn.onclick = () => {
+            new BookBrowserModal(this.host.plugin, () => this.refresh()).open();
         };
     }
     openEntry(entry) {
         const af = this.app.vault.getAbstractFileByPath(entry.key);
         if (af instanceof obsidian_1.TFile) {
-            void this.view.openSource({ kind: 'file', file: af });
+            void this.host.plugin.openBook({ kind: 'file', file: af });
         }
         else if (af instanceof obsidian_1.TFolder) {
-            void this.view.openSource({ kind: 'folder', folder: af });
+            void this.host.plugin.openBook({ kind: 'folder', folder: af });
         }
         else {
             new obsidian_1.Notice('这本书已不在库中');
             return;
         }
-        this.close();
+        if (this.host.closeOnOpen) {
+            this.host.close();
+        }
     }
+}
+function coverGradient(key) {
+    const h = coverHue(key);
+    return `linear-gradient(155deg, hsl(${h}, 42%, 56%), hsl(${(h + 28) % 360}, 38%, 40%))`;
+}
+/** 阅读器里的书架弹窗：轻量，读着书随手翻一下书架不用切视图 */
+class BookshelfModal extends obsidian_1.Modal {
+    constructor(plugin) {
+        super(plugin.app);
+        this.plugin = plugin;
+    }
+    onOpen() {
+        this.titleEl.setText('书架');
+        const wrap = this.contentEl.createDiv({ cls: 'nr-shelf-wrap' });
+        new ShelfList({ plugin: this.plugin, closeOnOpen: true, close: () => this.close() }, wrap).refresh();
+    }
+}
+/** 常驻书架视图：左侧图标 / 命令面板打开，和阅读器平级 */
+class BookshelfView extends obsidian_1.ItemView {
+    constructor(leaf, plugin) {
+        super(leaf);
+        this.list = null;
+        this.refreshTimer = null;
+        this.plugin = plugin;
+    }
+    getViewType() {
+        return exports.NOVEL_READER_SHELF_VIEW_TYPE;
+    }
+    getDisplayText() {
+        return '书架';
+    }
+    getIcon() {
+        return 'library';
+    }
+    async onOpen() {
+        this.contentEl.addClass('nr-shelf-view');
+        // 库里增删改名都会影响书架；防抖一下，别在同步风暴里反复重画
+        const schedule = () => this.scheduleRefresh();
+        this.registerEvent(this.app.vault.on('create', schedule));
+        this.registerEvent(this.app.vault.on('delete', schedule));
+        this.registerEvent(this.app.vault.on('rename', schedule));
+        this.render();
+    }
+    async onClose() {
+        if (this.refreshTimer !== null) {
+            window.clearTimeout(this.refreshTimer);
+            this.refreshTimer = null;
+        }
+    }
+    /** 外部（命令、插件事件）要求刷新：直接重取数据 */
+    refresh() {
+        if (this.list) {
+            this.list.refresh();
+        }
+        else {
+            this.render();
+        }
+    }
+    scheduleRefresh() {
+        if (this.refreshTimer !== null) {
+            window.clearTimeout(this.refreshTimer);
+        }
+        this.refreshTimer = window.setTimeout(() => {
+            this.refreshTimer = null;
+            this.refresh();
+        }, 400);
+    }
+    render() {
+        this.contentEl.empty();
+        this.contentEl.addClass('nr-shelf-view');
+        const wrap = this.contentEl.createDiv({ cls: 'nr-shelf-wrap' });
+        this.list = new ShelfList({ plugin: this.plugin, closeOnOpen: false, close: () => undefined }, wrap);
+        this.list.refresh();
+    }
+}
+exports.BookshelfView = BookshelfView;
+/** 书籍详情：进度、位置、路径、置顶与显示名都在这里操作 */
+class BookDetailModal extends obsidian_1.Modal {
+    constructor(plugin, entry, onChanged) {
+        super(plugin.app);
+        this.plugin = plugin;
+        this.entry = entry;
+        this.onChanged = onChanged;
+    }
+    onOpen() {
+        const entry = this.entry;
+        const plugin = this.plugin;
+        this.contentEl.addClass('nr-detail');
+        this.titleEl.setText('书籍详情');
+        const head = this.contentEl.createDiv({ cls: 'nr-detail-head' });
+        const cover = head.createDiv({ cls: 'nr-detail-cover' });
+        cover.style.background = coverGradient(entry.key);
+        cover.createDiv({ cls: 'nr-shelf-cover-letter', text: coverLetter(entry.title) });
+        const headMain = head.createDiv({ cls: 'nr-detail-head-main' });
+        headMain.createDiv({ cls: 'nr-detail-title', text: entry.title });
+        if (entry.title !== entry.realTitle) {
+            headMain.createDiv({ cls: 'nr-detail-sub', text: `原名：${entry.realTitle}` });
+        }
+        headMain.createDiv({ cls: 'nr-detail-sub', text: entry.detail });
+        const progress = plugin.data.books[entry.key];
+        const rows = [
+            ['进度', `${entry.overall}%${entry.finished ? '（已读完）' : ''}`],
+            [
+                '位置',
+                entry.chapterTitle
+                    ? `第 ${(progress ? progress.chapter : 0) + 1} 章 · ${entry.chapterTitle}${entry.chapterCount > 0 ? `（共 ${entry.chapterCount} 章）` : ''}`
+                    : entry.chapterCount > 0
+                        ? `共 ${entry.chapterCount} 章`
+                        : '还没开始读',
+            ],
+            ['书签', `${entry.bookmarks} 条`],
+            ['最后阅读', entry.updatedAt > 0 ? formatRelative(entry.updatedAt) : '从未'],
+            ['收藏', entry.starred ? '已收藏' : '未收藏'],
+            ['置顶', entry.pinned ? '已置顶' : '未置顶'],
+        ];
+        for (const [label, value] of rows) {
+            const row = this.contentEl.createDiv({ cls: 'nr-detail-row' });
+            row.createSpan({ cls: 'nr-detail-label', text: label });
+            row.createSpan({ cls: 'nr-detail-value', text: value });
+        }
+        const pathRow = this.contentEl.createDiv({ cls: 'nr-detail-row' });
+        pathRow.createSpan({ cls: 'nr-detail-label', text: '路径' });
+        const pathVal = pathRow.createSpan({ cls: 'nr-detail-value nr-detail-path', text: entry.key });
+        pathVal.setAttribute('title', '点击复制路径');
+        pathVal.addEventListener('click', () => {
+            void copyText(entry.key);
+        });
+        const actions = this.contentEl.createDiv({ cls: 'nr-detail-actions' });
+        const mk = (label, cls, onClick) => {
+            const btn = actions.createEl('button', { cls: `nr-btn ${cls}`.trim(), text: label });
+            btn.onclick = onClick;
+        };
+        mk('打开', 'nr-btn-primary', () => {
+            const af = this.app.vault.getAbstractFileByPath(entry.key);
+            if (af instanceof obsidian_1.TFile) {
+                void plugin.openBook({ kind: 'file', file: af });
+            }
+            else if (af instanceof obsidian_1.TFolder) {
+                void plugin.openBook({ kind: 'folder', folder: af });
+            }
+            else {
+                new obsidian_1.Notice('这本书已不在库中');
+                return;
+            }
+            this.close();
+        });
+        mk(entry.pinned ? '取消置顶' : '置顶', '', () => {
+            const on = plugin.togglePin(entry.key);
+            entry.pinned = on;
+            new obsidian_1.Notice(on ? `已置顶《${entry.title}》` : '已取消置顶');
+            this.onChanged();
+            this.close();
+        });
+        mk('改显示名', '', () => {
+            new TextPromptModal(this.app, '书架显示名', entry.title === entry.realTitle ? '' : entry.title, entry.realTitle, (value) => {
+                plugin.setBookAlias(entry.key, value);
+                new obsidian_1.Notice(value.trim().length > 0 ? `显示名已改为《${value.trim()}》` : '已恢复真实文件名');
+                this.onChanged();
+            }).open();
+        });
+        mk(entry.starred ? '取消收藏' : '收藏', '', () => {
+            const on = plugin.toggleShelf(entry.key);
+            entry.starred = on;
+            new obsidian_1.Notice(on ? `已收藏《${entry.title}》` : `已取消收藏《${entry.title}》`);
+            this.onChanged();
+            this.close();
+        });
+        mk('重置进度', '', () => {
+            new ConfirmModal(this.app, '重置阅读进度', `把《${entry.title}》的进度清零？收藏与书签会保留。`, () => {
+                plugin.resetBookProgress(entry.key);
+                new obsidian_1.Notice('进度已重置');
+                this.onChanged();
+                this.close();
+            }).open();
+        });
+        mk('移除', 'nr-btn-danger', () => {
+            new ConfirmModal(this.app, '从书架移除', `移除《${entry.title}》的全部记录？`, () => {
+                plugin.removeFromShelf(entry.key);
+                new obsidian_1.Notice(`已移除《${entry.title}》`);
+                const view = plugin.getActiveReaderView();
+                if (view && view.hasSource && view.sourceKey() === entry.key) {
+                    view.closeSource();
+                }
+                this.onChanged();
+                this.close();
+            }).open();
+        });
+        if (obsidian_1.Platform.isDesktopApp) {
+            mk('在文件管理器中显示', '', () => {
+                const api = this.app;
+                if (typeof api.openWithDefaultApp === 'function') {
+                    api.openWithDefaultApp(entry.key);
+                }
+                else {
+                    new obsidian_1.Notice('当前版本不支持这个操作');
+                }
+            });
+        }
+    }
+}
+/** 单行文本输入弹窗：改显示名这类小输入，移动端也能用 */
+class TextPromptModal extends obsidian_1.Modal {
+    constructor(app, title, value, placeholder, onSubmit) {
+        super(app);
+        this.title = title;
+        this.value = value;
+        this.placeholder = placeholder;
+        this.onSubmit = onSubmit;
+    }
+    onOpen() {
+        this.titleEl.setText(this.title);
+        const input = this.contentEl.createEl('input', {
+            cls: 'nr-prompt-input',
+            type: 'text',
+            value: this.value,
+            placeholder: this.placeholder,
+        });
+        const submit = () => {
+            this.onSubmit(input.value);
+            this.close();
+        };
+        input.addEventListener('keydown', (evt) => {
+            if (evt.key === 'Enter') {
+                evt.preventDefault();
+                submit();
+            }
+        });
+        const row = this.contentEl.createDiv({ cls: 'nr-pick-actions' });
+        const cancel = row.createEl('button', { cls: 'nr-btn', text: '取消' });
+        cancel.onclick = () => this.close();
+        const ok = row.createEl('button', { cls: 'nr-btn nr-btn-primary', text: '确定' });
+        ok.onclick = () => submit();
+        window.setTimeout(() => {
+            input.focus();
+            input.select();
+        }, 0);
+    }
+}
+/** 复制文本到剪贴板：移动端没有剪贴板权限时退化成提示 */
+async function copyText(text) {
+    try {
+        const nav = navigator;
+        if (nav.clipboard && typeof nav.clipboard.writeText === 'function') {
+            await nav.clipboard.writeText(text);
+            new obsidian_1.Notice('路径已复制');
+            return;
+        }
+    }
+    catch (_a) {
+        // 剪贴板不可用（部分移动端环境），走下面的兜底提示
+    }
+    new obsidian_1.Notice(text);
 }
 /** 浏览全库：搜索 + 打开 + 收藏（没读过也能直接上架） */
 class BookBrowserModal extends obsidian_1.Modal {
-    constructor(plugin, view) {
+    constructor(plugin, changed) {
         super(plugin.app);
         this.items = [];
         this.filter = '';
@@ -1905,7 +2593,7 @@ class BookBrowserModal extends obsidian_1.Modal {
         this.moreBtn = null;
         this.rendered = 0;
         this.plugin = plugin;
-        this.view = view;
+        this.changed = changed || null;
     }
     onOpen() {
         this.contentEl.addClass('nr-browse');
@@ -1925,6 +2613,11 @@ class BookBrowserModal extends obsidian_1.Modal {
         this.moreBtn.onclick = () => this.renderMore();
         this.items = collectLibrary(this.app, this.plugin.data.settings.deepBrowse).sort((a, b) => comparePaths(itemPath(a), itemPath(b)));
         this.reset();
+    }
+    onClose() {
+        if (this.changed) {
+            this.changed();
+        }
     }
     reset() {
         if (!this.listEl) {
@@ -1986,7 +2679,7 @@ class BookBrowserModal extends obsidian_1.Modal {
         const openBtn = row.createEl('button', { cls: 'nr-btn', text: '打开' });
         openBtn.onclick = () => {
             this.close();
-            void this.view.openSource(item);
+            void this.plugin.openBook(item);
         };
         const starBtn = row.createEl('button', {
             cls: 'nr-btn nr-btn-star',
@@ -2267,6 +2960,20 @@ class NovelReaderSettingTab extends obsidian_1.PluginSettingTab {
             toggle.setValue(settings.deepBrowse).onChange((value) => {
                 settings.deepBrowse = value;
                 this.plugin.saveSoon();
+            });
+        });
+        new obsidian_1.Setting(containerEl)
+            .setName('书架默认视图')
+            .setDesc('书架用网格卡片还是列表打开。书架里随时能切，会记住最后一次的选择')
+            .addDropdown((drop) => {
+            drop
+                .addOption('grid', '网格卡片')
+                .addOption('list', '列表')
+                .setValue(settings.shelfView)
+                .onChange((value) => {
+                settings.shelfView = value === 'list' ? 'list' : 'grid';
+                this.plugin.saveSoon();
+                this.plugin.refreshShelfViews();
             });
         });
         new obsidian_1.Setting(containerEl)
