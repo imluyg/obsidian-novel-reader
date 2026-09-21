@@ -31,6 +31,8 @@ const CHAPTER_MAX_CHARS = 24000;
 const MIN_CHAPTER_CHARS = 300;
 /** 目录弹窗一次渲染多少条，超出的点「显示更多」追加（大书可能有上千章） */
 const TOC_PAGE = 300;
+/** 浏览全库弹窗一次渲染多少条 */
+const BROWSE_PAGE = 80;
 
 const GAP = 48;
 const FONT_MIN = 12;
@@ -74,7 +76,10 @@ export interface ShelfEntry {
   title: string;
   detail: string;
   overall: number;
+  /** 排序用的时间戳：最后阅读时间与收藏时间取较新的那个 */
   updatedAt: number;
+  /** 显式收藏过（没读过也会留在书架上） */
+  starred: boolean;
 }
 
 export interface BookmarkItem {
@@ -96,6 +101,8 @@ export interface PluginData {
   bookmarks: Record<string, BookmarkItem[]>;
   /** 每本书覆盖全局默认的排版，空对象表示全部沿用默认值 */
   bookStyle: Record<string, Partial<Typography>>;
+  /** 显式收藏：路径 → 收藏时间。没读过也能上架，不会被"没进度"过滤掉 */
+  shelf: Record<string, number>;
 }
 
 const DEFAULTS: PluginData = {
@@ -112,6 +119,7 @@ const DEFAULTS: PluginData = {
   bookConfig: {},
   bookmarks: {},
   bookStyle: {},
+  shelf: {},
 };
 
 /** 兼容旧版本（v0.3.0 及以前）的进度结构：缺 chapter 字段时兜底为第 0 章 */
@@ -162,6 +170,8 @@ export default class NovelReaderPlugin extends Plugin {
       bookConfig: (loaded && loaded.bookConfig) || {},
       bookmarks: (loaded && loaded.bookmarks) || {},
       bookStyle: (loaded && loaded.bookStyle) || {},
+      // 0.2.x 只有进度表，没有收藏表：老数据直接当空收藏表，书架行为保持不变
+      shelf: (loaded && loaded.shelf) || {},
     };
     // 把历史数据（可能缺 chapter 字段）统一规范化，避免老版本升级后定位异常
     for (const key of Object.keys(this.data.books)) {
@@ -181,6 +191,7 @@ export default class NovelReaderPlugin extends Plugin {
     // （视图打开着的情形由视图自己处理，这里跳过，避免重复迁移）
     this.registerEvent(
       this.app.vault.on('rename', (file, oldPath) => {
+        invalidateFolderCache();
         if (this.readerViews().some((v) => v.handlesPath(oldPath))) {
           return;
         }
@@ -194,6 +205,7 @@ export default class NovelReaderPlugin extends Plugin {
     );
     this.registerEvent(
       this.app.vault.on('delete', (file) => {
+        invalidateFolderCache();
         const path = file.path;
         if (this.readerViews().some((v) => v.handlesPath(path))) {
           return;
@@ -205,6 +217,20 @@ export default class NovelReaderPlugin extends Plugin {
           this.data.bookStyle[path]
         ) {
           this.removeFromShelf(path);
+        }
+      })
+    );
+    // 文件夹篇数缓存：任何可能改变 md 数量的变动都整表失效（重建很便宜，正确性优先）
+    this.registerEvent(
+      this.app.vault.on('create', () => {
+        invalidateFolderCache();
+      })
+    );
+    this.registerEvent(
+      this.app.vault.on('modify', (file) => {
+        // 空占位文件被写入正文后才会计入篇数，所以 md 改动也要失效
+        if (file instanceof TFile && file.extension === 'md') {
+          invalidateFolderCache();
         }
       })
     );
@@ -248,6 +274,23 @@ export default class NovelReaderPlugin extends Plugin {
         }
         if (!checking) {
           new BookshelfModal(this, view).open();
+        }
+        return true;
+      },
+    });
+
+    this.addCommand({
+      id: 'toggle-shelf-star',
+      name: '把当前书籍加入/移出书架',
+      checkCallback: (checking: boolean): boolean => {
+        const view = this.getActiveReaderView();
+        if (!view || !view.hasSource) {
+          return false;
+        }
+        if (!checking) {
+          const key = view.sourceKey();
+          const starred = this.toggleShelf(key);
+          new Notice(starred ? `已把《${view.getDisplayText()}》加入书架` : '已移出书架收藏');
         }
         return true;
       },
@@ -328,41 +371,112 @@ export default class NovelReaderPlugin extends Plugin {
     new BookSuggester(this, view).open();
   }
 
-  /** 书架：已读过（有进度记录）且仍存在的书，按最近阅读排序 */
+  /**
+   * 书架 = 收藏过的书 ∪ 读过的书，按最近活动排序。
+   * 只留"真正读过"的进度：误开一次的单章/设定稿（overall=0 且从未写入过进度）
+   * 不该占书架位置——除非手动收藏过。
+   */
   public getShelf(): ShelfEntry[] {
+    const keys = new Set<string>(Object.keys(this.data.books));
+    for (const key of Object.keys(this.data.shelf)) {
+      keys.add(key);
+    }
     const entries: ShelfEntry[] = [];
-    for (const key of Object.keys(this.data.books)) {
-      const af = this.app.vault.getAbstractFileByPath(key);
+    for (const key of keys) {
       const progress = this.data.books[key];
+      const starredAt = this.data.shelf[key] || 0;
+      if (!starredAt && progress && progress.updatedAt === 0 && progress.overall === 0) {
+        continue;
+      }
+      const af = this.app.vault.getAbstractFileByPath(key);
+      const base = {
+        key,
+        overall: progress ? progress.overall : 0,
+        updatedAt: Math.max(starredAt, progress ? progress.updatedAt : 0),
+        starred: starredAt > 0,
+      };
       if (af instanceof TFolder) {
         entries.push({
-          key,
+          ...base,
           kind: 'folder',
           title: af.name,
           detail: `文件夹 · ${countMd(af)} 篇`,
-          overall: progress.overall,
-          updatedAt: progress.updatedAt,
         });
       } else if (af instanceof TFile) {
-        entries.push({
-          key,
-          kind: 'file',
-          title: af.basename,
-          detail: '单文件',
-          overall: progress.overall,
-          updatedAt: progress.updatedAt,
-        });
+        entries.push({ ...base, kind: 'file', title: af.basename, detail: '单文件' });
       }
     }
     return entries.sort((a, b) => b.updatedAt - a.updatedAt);
   }
 
-  /** 从书架移除：清掉进度、书签与章节配置（书本身不动） */
+  /** 收藏一本书：没读过也能上架 */
+  public addToShelf(path: string): void {
+    this.data.shelf[path] = Date.now();
+    this.saveSoon();
+  }
+
+  public isStarred(path: string): boolean {
+    return !!this.data.shelf[path];
+  }
+
+  /** 收藏开关，返回操作后的状态（true = 已收藏） */
+  public toggleShelf(path: string): boolean {
+    if (this.data.shelf[path]) {
+      delete this.data.shelf[path];
+      this.saveSoon();
+      return false;
+    }
+    this.addToShelf(path);
+    return true;
+  }
+
+  /**
+   * 清理两类垃圾记录：文件已不在库的（失效），以及从未真正读过又没收藏的（僵尸）。
+   * 只动插件自己的数据，不动库里的文件。
+   */
+  public pruneStale(): { missing: number; zombie: number } {
+    const d = this.data;
+    const alive = (key: string): boolean => !!this.app.vault.getAbstractFileByPath(key);
+    let missing = 0;
+    let zombie = 0;
+    const stores: Array<Record<string, unknown>> = [
+      d.books,
+      d.bookConfig,
+      d.bookmarks,
+      d.bookStyle,
+      d.shelf,
+    ];
+    for (const store of stores) {
+      for (const key of Object.keys(store)) {
+        if (!alive(key)) {
+          delete store[key];
+          missing += 1;
+        }
+      }
+    }
+    for (const key of Object.keys(d.books)) {
+      const p = d.books[key];
+      if (!d.shelf[key] && p.updatedAt === 0 && p.overall === 0) {
+        delete d.books[key];
+        zombie += 1;
+      }
+    }
+    if (d.lastBook && !alive(d.lastBook)) {
+      d.lastBook = null;
+    }
+    if (missing + zombie > 0) {
+      this.saveSoon();
+    }
+    return { missing, zombie };
+  }
+
+  /** 从书架移除：清掉进度、收藏、书签与章节配置（书本身不动） */
   public removeFromShelf(key: string): void {
     delete this.data.books[key];
     delete this.data.bookmarks[key];
     delete this.data.bookConfig[key];
     delete this.data.bookStyle[key];
+    delete this.data.shelf[key];
     if (this.data.lastBook === key) {
       this.data.lastBook = null;
     }
@@ -390,6 +504,10 @@ export default class NovelReaderPlugin extends Plugin {
     if (d.bookStyle[oldPath]) {
       d.bookStyle[newPath] = d.bookStyle[oldPath];
       delete d.bookStyle[oldPath];
+    }
+    if (d.shelf[oldPath]) {
+      d.shelf[newPath] = d.shelf[oldPath];
+      delete d.shelf[oldPath];
     }
     if (d.lastBook === oldPath) {
       d.lastBook = newPath;
@@ -1904,10 +2022,37 @@ class ReaderSearchModal extends FuzzySuggestModal<FindItem> {
 
 /* ---------------- 书架 / 选书 / 搜索 ---------------- */
 
-/** 书架：继续阅读 + 读过清单（带进度与移除）+ 浏览全库加书 */
+type ShelfSort = 'recent' | 'title' | 'progress';
+
+/** 最后活动时间的人类可读形式，书架里比裸时间戳好用 */
+function formatRelative(ts: number): string {
+  const diff = Date.now() - ts;
+  if (diff < 60000) {
+    return '刚刚';
+  }
+  if (diff < 3600000) {
+    return `${Math.floor(diff / 60000)} 分钟前`;
+  }
+  if (diff < 86400000) {
+    return `${Math.floor(diff / 3600000)} 小时前`;
+  }
+  if (diff < 2592000000) {
+    return `${Math.floor(diff / 86400000)} 天前`;
+  }
+  const d = new Date(ts);
+  const pad = (n: number): string => (n < 10 ? `0${n}` : String(n));
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+
+/** 书架：过滤 + 排序 + 进度条 + 收藏开关 + 浏览全库加书 */
 class BookshelfModal extends Modal {
   private readonly plugin: NovelReaderPlugin;
   private readonly view: NovelReaderView;
+  private entries: ShelfEntry[] = [];
+  private sort: ShelfSort = 'recent';
+  private filter = '';
+  private listEl: HTMLElement | null = null;
+  private hintEl: HTMLElement | null = null;
 
   constructor(plugin: NovelReaderPlugin, view: NovelReaderView) {
     super(plugin.app);
@@ -1918,58 +2063,315 @@ class BookshelfModal extends Modal {
   public onOpen(): void {
     this.contentEl.addClass('nr-shelf');
     this.titleEl.setText('书架');
+    this.entries = this.plugin.getShelf();
 
-    const shelf = this.plugin.getShelf();
-    const currentKey = this.view.hasSource ? this.view.sourceKey() : null;
-
-    if (shelf.length === 0) {
-      const hint = this.contentEl.createDiv({ cls: 'nr-shelf-hint' });
-      hint.setText('书架还是空的，从下面浏览库添加一本书吧');
-    } else {
-      for (const entry of shelf) {
-        const row = this.contentEl.createDiv({ cls: 'nr-shelf-item' });
-        const main = row.createDiv({ cls: 'nr-shelf-main' });
-        main.createDiv({ cls: 'nr-shelf-title', text: entry.title });
-        main.createDiv({
-          cls: 'nr-shelf-meta',
-          text: `${entry.detail} · 已读 ${entry.overall}%${entry.key === currentKey ? ' · 正在阅读' : ''}`,
-        });
-
-        const openBtn = row.createEl('button', { cls: 'nr-btn', text: '打开' });
-        openBtn.onclick = () => {
-          const af = this.app.vault.getAbstractFileByPath(entry.key);
-          if (af instanceof TFile) {
-            void this.view.openSource({ kind: 'file', file: af });
-          } else if (af instanceof TFolder) {
-            void this.view.openSource({ kind: 'folder', folder: af });
-          } else {
-            new Notice('这本书已不在库中');
-          }
-          this.close();
-        };
-
-        const delBtn = row.createEl('button', { cls: 'nr-btn nr-btn-danger', text: '移除' });
-        delBtn.onclick = () => {
-          new ConfirmModal(this.app, '从书架移除', `移除《${entry.title}》的阅读记录、书签与章节配置？`, () => {
-            this.plugin.removeFromShelf(entry.key);
-            new Notice(`已移除《${entry.title}》`);
-            if (this.view.hasSource && this.view.sourceKey() === entry.key) {
-              void this.view.closeSource();
-            }
-            this.close();
-          }).open();
-        };
-      }
+    const bar = this.contentEl.createDiv({ cls: 'nr-shelf-toolbar' });
+    const input = bar.createEl('input', { type: 'search' });
+    input.placeholder = '过滤书名或路径…';
+    // 精简版 obsidian.d.ts 里 Modal 没有 registerDomEvent；这些节点随弹窗一起销毁，不用手动解绑
+    input.addEventListener('input', () => {
+      this.filter = input.value.trim().toLowerCase();
+      this.render();
+    });
+    const select = bar.createEl('select', { cls: 'nr-shelf-sort' });
+    for (const opt of [
+      { value: 'recent', label: '最近阅读' },
+      { value: 'title', label: '按书名' },
+      { value: 'progress', label: '按进度' },
+    ]) {
+      select.createEl('option', { value: opt.value, text: opt.label });
     }
+    select.addEventListener('change', () => {
+      this.sort = select.value as ShelfSort;
+      this.render();
+    });
+
+    this.hintEl = this.contentEl.createDiv({ cls: 'nr-shelf-hint' });
+    this.listEl = this.contentEl.createDiv({ cls: 'nr-shelf-list' });
+    this.render();
 
     const actions = this.contentEl.createDiv({ cls: 'nr-shelf-actions' });
-    const browseBtn = actions.createEl('button', { cls: 'nr-btn nr-btn-primary', text: '浏览全库添加书籍' });
+    const browseBtn = actions.createEl('button', {
+      cls: 'nr-btn nr-btn-primary',
+      text: '浏览全库添加书籍',
+    });
     browseBtn.onclick = () => {
       const targetView = this.view;
       this.close();
-      new BookSuggester(this.plugin, targetView).open();
+      new BookBrowserModal(this.plugin, targetView).open();
     };
   }
+
+  /** 换排序 / 输入过滤 / 切收藏后重画列表 */
+  private render(): void {
+    const list = this.listEl;
+    const hint = this.hintEl;
+    if (!list || !hint) {
+      return;
+    }
+    if (this.entries.length === 0) {
+      hint.setText('书架还是空的，从下面浏览库添加一本书吧');
+      hint.style.display = '';
+      list.empty();
+      return;
+    }
+    const keyword = this.filter;
+    const shown = this.entries
+      .filter(
+        (e) =>
+          keyword.length === 0 ||
+          e.title.toLowerCase().includes(keyword) ||
+          e.key.toLowerCase().includes(keyword)
+      )
+      .sort((a, b) => {
+        if (this.sort === 'title') {
+          return naturalCompare(a.title, b.title);
+        }
+        if (this.sort === 'progress') {
+          return b.overall - a.overall || b.updatedAt - a.updatedAt;
+        }
+        return b.updatedAt - a.updatedAt;
+      });
+    list.empty();
+    if (shown.length === 0) {
+      hint.setText('没有匹配的书');
+      hint.style.display = '';
+      return;
+    }
+    hint.style.display = 'none';
+    const currentKey = this.view.hasSource ? this.view.sourceKey() : null;
+    for (const entry of shown) {
+      this.renderRow(list, entry, entry.key === currentKey);
+    }
+  }
+
+  private renderRow(parent: HTMLElement, entry: ShelfEntry, current: boolean): void {
+    const row = parent.createDiv({ cls: 'nr-shelf-item' });
+    if (current) {
+      row.addClass('nr-shelf-current');
+    }
+    const main = row.createDiv({ cls: 'nr-shelf-main' });
+    main.createDiv({ cls: 'nr-shelf-title', text: entry.title });
+    const bar = main.createDiv({ cls: 'nr-shelf-bar' });
+    const fill = bar.createDiv({ cls: 'nr-shelf-bar-fill' });
+    fill.style.width = `${Math.min(100, Math.max(0, entry.overall))}%`;
+    const tags: string[] = [entry.detail, `已读 ${entry.overall}%`];
+    if (entry.updatedAt > 0) {
+      tags.push(formatRelative(entry.updatedAt));
+    }
+    if (current) {
+      tags.push('正在阅读');
+    }
+    main.createDiv({ cls: 'nr-shelf-meta', text: tags.join(' · ') });
+
+    row.addEventListener('click', () => this.openEntry(entry));
+
+    const openBtn = row.createEl('button', { cls: 'nr-btn', text: '打开' });
+    openBtn.onclick = (evt: MouseEvent) => {
+      evt.stopPropagation();
+      this.openEntry(entry);
+    };
+
+    const starBtn = row.createEl('button', {
+      cls: `nr-btn nr-btn-star${entry.starred ? ' nr-btn-star-on' : ''}`,
+      text: entry.starred ? '★' : '☆',
+    });
+    starBtn.setAttribute('title', entry.starred ? '取消收藏' : '加入书架');
+    starBtn.onclick = (evt: MouseEvent) => {
+      evt.stopPropagation();
+      const on = this.plugin.toggleShelf(entry.key);
+      starBtn.setText(on ? '★' : '☆');
+      starBtn.toggleClass('nr-btn-star-on', on);
+      entry.starred = on;
+      new Notice(on ? `已收藏《${entry.title}》` : `已取消收藏《${entry.title}》`);
+      // 取消收藏后，如果这本书其实没真正读过，就不该继续占着书架
+      const progress = this.plugin.data.books[entry.key];
+      if (!on && (!progress || (progress.updatedAt === 0 && progress.overall === 0))) {
+        this.entries = this.plugin.getShelf();
+        this.render();
+      }
+    };
+
+    const delBtn = row.createEl('button', { cls: 'nr-btn nr-btn-danger', text: '移除' });
+    delBtn.onclick = (evt: MouseEvent) => {
+      evt.stopPropagation();
+      new ConfirmModal(
+        this.app,
+        '从书架移除',
+        `移除《${entry.title}》的阅读记录、收藏、书签与章节配置？`,
+        () => {
+          this.plugin.removeFromShelf(entry.key);
+          new Notice(`已移除《${entry.title}》`);
+          if (this.view.hasSource && this.view.sourceKey() === entry.key) {
+            void this.view.closeSource();
+          }
+          this.entries = this.plugin.getShelf();
+          this.render();
+        }
+      ).open();
+    };
+  }
+
+  private openEntry(entry: ShelfEntry): void {
+    const af = this.app.vault.getAbstractFileByPath(entry.key);
+    if (af instanceof TFile) {
+      void this.view.openSource({ kind: 'file', file: af });
+    } else if (af instanceof TFolder) {
+      void this.view.openSource({ kind: 'folder', folder: af });
+    } else {
+      new Notice('这本书已不在库中');
+      return;
+    }
+    this.close();
+  }
+}
+
+/** 浏览全库：搜索 + 打开 + 收藏（没读过也能直接上架） */
+class BookBrowserModal extends Modal {
+  private readonly plugin: NovelReaderPlugin;
+  private readonly view: NovelReaderView;
+  private items: PickItem[] = [];
+  private filter = '';
+  private listEl: HTMLElement | null = null;
+  private hintEl: HTMLElement | null = null;
+  private moreBtn: HTMLElement | null = null;
+  private rendered = 0;
+
+  constructor(plugin: NovelReaderPlugin, view: NovelReaderView) {
+    super(plugin.app);
+    this.plugin = plugin;
+    this.view = view;
+  }
+
+  public onOpen(): void {
+    this.contentEl.addClass('nr-browse');
+    this.titleEl.setText('浏览书库');
+
+    const input = this.contentEl.createEl('input', { cls: 'nr-browse-input', type: 'search' });
+    input.placeholder = '搜索书名或路径…';
+    input.addEventListener('input', () => {
+      this.filter = input.value.trim().toLowerCase();
+      this.reset();
+    });
+
+    this.hintEl = this.contentEl.createDiv({ cls: 'nr-shelf-hint' });
+    this.listEl = this.contentEl.createDiv({ cls: 'nr-browse-list' });
+    this.moreBtn = this.contentEl.createEl('button', {
+      cls: 'nr-btn nr-toc-more',
+      text: '显示更多',
+    });
+    this.moreBtn.onclick = () => this.renderMore();
+
+    this.items = collectLibrary(this.app, this.plugin.data.settings.deepBrowse).sort((a, b) =>
+      comparePaths(itemPath(a), itemPath(b))
+    );
+    this.reset();
+  }
+
+  private reset(): void {
+    if (!this.listEl) {
+      return;
+    }
+    this.listEl.empty();
+    this.rendered = 0;
+    this.renderMore();
+  }
+
+  private matched(): PickItem[] {
+    const keyword = this.filter;
+    if (keyword.length === 0) {
+      return this.items;
+    }
+    return this.items.filter((item) => itemPath(item).toLowerCase().includes(keyword));
+  }
+
+  /** 分批渲染：库里上千个 md 时一次全建 DOM 会把弹窗卡住 */
+  private renderMore(): void {
+    const list = this.listEl;
+    const hint = this.hintEl;
+    const moreBtn = this.moreBtn;
+    if (!list || !hint || !moreBtn) {
+      return;
+    }
+    const all = this.matched();
+    if (all.length === 0) {
+      hint.setText(this.items.length === 0 ? '库里没有可读的 Markdown' : '没有匹配的书');
+      hint.style.display = '';
+      moreBtn.style.display = 'none';
+      return;
+    }
+    hint.setText(`共 ${all.length} 本，已显示 ${Math.min(all.length, this.rendered + BROWSE_PAGE)} 本`);
+    hint.style.display = '';
+    const end = Math.min(all.length, this.rendered + BROWSE_PAGE);
+    for (let i = this.rendered; i < end; i++) {
+      this.renderRow(list, all[i]);
+    }
+    this.rendered = end;
+    moreBtn.style.display = this.rendered < all.length ? '' : 'none';
+  }
+
+  private renderRow(parent: HTMLElement, item: PickItem): void {
+    const path = itemPath(item);
+    const title = item.kind === 'file' ? item.file.basename : item.folder.name;
+    const row = parent.createDiv({ cls: 'nr-browse-item' });
+    const main = row.createDiv({ cls: 'nr-browse-main' });
+    main.createDiv({ cls: 'nr-browse-title', text: title });
+
+    const tags: string[] =
+      item.kind === 'file' ? ['单文件'] : [`文件夹 · ${countMd(item.folder)} 篇`];
+    const progress = this.plugin.data.books[path];
+    if (this.plugin.isStarred(path)) {
+      tags.push('已在书架');
+    } else if (progress) {
+      tags.push(`已读 ${progress.overall}%`);
+    }
+    main.createDiv({
+      cls: 'nr-browse-meta',
+      text: `${path.replace(/\.md$/, '')} · ${tags.join(' · ')}`,
+    });
+
+    const openBtn = row.createEl('button', { cls: 'nr-btn', text: '打开' });
+    openBtn.onclick = () => {
+      this.close();
+      void this.view.openSource(item);
+    };
+
+    const starBtn = row.createEl('button', {
+      cls: 'nr-btn nr-btn-star',
+      text: this.plugin.isStarred(path) ? '★ 移出' : '☆ 加入',
+    });
+    starBtn.onclick = () => {
+      const on = this.plugin.toggleShelf(path);
+      starBtn.setText(on ? '★ 移出' : '☆ 加入');
+      starBtn.toggleClass('nr-btn-star-on', on);
+      new Notice(on ? `已加入书架：${title}` : `已移出书架：${title}`);
+    };
+  }
+}
+
+function itemPath(item: PickItem): string {
+  return item.kind === 'file' ? item.file.path : item.folder.path;
+}
+
+/** 库里可选的书：单文件 md 与含 md 的文件夹；deep=false 时只列根目录 */
+function collectLibrary(app: App, deep: boolean): PickItem[] {
+  const items: PickItem[] = [];
+  const walk = (folder: TFolder): void => {
+    for (const child of folder.children) {
+      if (child instanceof TFile) {
+        if (child.extension === 'md' && !isEmptyFile(child)) {
+          items.push({ kind: 'file', file: child });
+        }
+      } else if (child instanceof TFolder && !child.name.startsWith('.') && folderHasMd(child)) {
+        items.push({ kind: 'folder', folder: child });
+        if (deep) {
+          walk(child);
+        }
+      }
+    }
+  };
+  walk(app.vault.getRoot());
+  return items;
 }
 
 class ConfirmModal extends Modal {
@@ -2015,36 +2417,20 @@ class BookSuggester extends FuzzySuggestModal<PickItem> {
 
   /** 列出可选的书：默认递归进子文件夹，设置里可以关掉只留根目录 */
   public getItems(): PickItem[] {
-    const deep = this.plugin.data.settings.deepBrowse;
-    const items: PickItem[] = [];
-    const walk = (folder: TFolder): void => {
-      for (const child of folder.children) {
-        if (child instanceof TFile) {
-          if (child.extension === 'md' && !isEmptyFile(child)) {
-            items.push({ kind: 'file', file: child });
-          }
-        } else if (child instanceof TFolder && !child.name.startsWith('.') && folderHasMd(child)) {
-          items.push({ kind: 'folder', folder: child });
-          if (deep) {
-            walk(child);
-          }
-        }
-      }
-    };
-    walk(this.app.vault.getRoot());
-    return items;
+    return collectLibrary(this.app, this.plugin.data.settings.deepBrowse);
   }
 
   public getItemText(item: PickItem): string {
-    const path = item.kind === 'file' ? item.file.path : item.folder.path;
+    const path = itemPath(item);
     // 带上路径，递归浏览时能分清同名章节文件在哪一层
     const label = path.replace(/\.md$/, '');
     const stored = this.plugin.data.books[path];
+    const star = this.plugin.isStarred(path) ? '★ ' : '';
     const prefix = stored ? `已读 ${stored.overall}% · ` : '';
     if (item.kind === 'file') {
-      return `${prefix}${label} · 单文件`;
+      return `${star}${prefix}${label} · 单文件`;
     }
-    return `${prefix}${label} · 文件夹 · ${countMd(item.folder)} 篇`;
+    return `${star}${prefix}${label} · 文件夹 · ${countMd(item.folder)} 篇`;
   }
 
   public onChooseItem(item: PickItem): void {
@@ -2056,7 +2442,22 @@ class BookSuggester extends FuzzySuggestModal<PickItem> {
   }
 }
 
+/**
+ * 文件夹 md 篇数缓存。书架和选书器每次打开都要用它，不缓存就是反复递归整库
+ * （选书器还要对每个文件夹再判一次 hasMd，等于 O(n²)）。
+ * 失效时机：vault 的 create / delete / rename / md 改动，重建很便宜。
+ */
+const folderCountCache = new Map<string, number>();
+
+function invalidateFolderCache(): void {
+  folderCountCache.clear();
+}
+
 function countMd(folder: TFolder): number {
+  const cached = folderCountCache.get(folder.path);
+  if (cached !== undefined) {
+    return cached;
+  }
   let n = 0;
   for (const child of folder.children) {
     if (child instanceof TFile && child.extension === 'md') {
@@ -2067,6 +2468,7 @@ function countMd(folder: TFolder): number {
       n += countMd(child);
     }
   }
+  folderCountCache.set(folder.path, n);
   return n;
 }
 
@@ -2254,6 +2656,28 @@ class NovelReaderSettingTab extends PluginSettingTab {
         toggle.setValue(settings.deepBrowse).onChange((value) => {
           settings.deepBrowse = value;
           this.plugin.saveSoon();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName('清理失效记录')
+      .setDesc('删掉文件已不在库的阅读记录，以及只误开过一次、从未真正读过的记录。收藏与库里的文件不受影响')
+      .addButton((btn) => {
+        btn.setButtonText('清理').onClick(() => {
+          new ConfirmModal(
+            this.app,
+            '清理失效记录',
+            '清理文件已不在库的记录，以及从未真正读过且未收藏的记录？书签与收藏会保留。',
+            () => {
+              const result = this.plugin.pruneStale();
+              if (result.missing + result.zombie === 0) {
+                new Notice('没有需要清理的记录');
+              } else {
+                new Notice(`已清理 ${result.missing} 条失效记录、${result.zombie} 条未读记录`);
+              }
+              this.display();
+            }
+          ).open();
         });
       });
 

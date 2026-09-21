@@ -137,12 +137,82 @@
 }
 
 /* ---------- 书架 ---------- */
-.nr-shelf-item {
+.nr-shelf-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.nr-shelf-toolbar input {
+  flex: 1;
+  min-width: 0;
+}
+.nr-shelf-sort {
+  flex-shrink: 0;
+  max-width: 42%;
+}
+.nr-shelf-list,
+.nr-browse-list {
+  display: flex;
+  flex-direction: column;
+  max-height: 56vh;
+  overflow-y: auto;
+}
+.nr-shelf-item,
+.nr-browse-item {
   display: flex;
   align-items: center;
   gap: 10px;
   padding: 8px 4px;
   border-bottom: 1px solid var(--background-modifier-border);
+}
+.nr-shelf-item {
+  cursor: pointer;
+}
+.nr-shelf-item:hover {
+  background: var(--background-modifier-hover);
+}
+.nr-shelf-item .nr-btn,
+.nr-browse-item .nr-btn {
+  flex-shrink: 0;
+}
+/* 书架里正在读的这一本 */
+.nr-shelf-current {
+  border-left: 3px solid var(--interactive-accent);
+  padding-left: 6px;
+}
+.nr-shelf-bar {
+  height: 3px;
+  margin: 5px 0 3px;
+  border-radius: 2px;
+  background: var(--background-modifier-border);
+  overflow: hidden;
+}
+.nr-shelf-bar-fill {
+  height: 100%;
+  background: var(--interactive-accent);
+}
+.nr-browse-input {
+  width: 100%;
+  margin-bottom: 8px;
+}
+.nr-browse-title {
+  font-size: var(--font-ui-medium);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.nr-browse-meta {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+  word-break: break-all;
+}
+.nr-btn-star {
+  min-width: 34px;
+  padding: 6px 8px;
+}
+.nr-btn-star-on {
+  color: var(--text-accent);
 }
 .nr-shelf-main {
   flex: 1;
