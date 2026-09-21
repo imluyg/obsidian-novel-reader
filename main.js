@@ -37,6 +37,8 @@ function normalizeProgress(raw) {
         chapter: Math.max(0, Math.floor(num(rec.chapter, 0))),
         cid: Math.max(0, Math.floor(num(rec.cid, 0))),
         percent: Math.min(1, Math.max(0, num(rec.percent, 0))),
+        overall: Math.min(100, Math.max(0, num(rec.overall, 0))),
+        updatedAt: typeof rec.updatedAt === 'number' && Number.isFinite(rec.updatedAt) ? rec.updatedAt : 0,
     };
 }
 /* ---------------- 插件入口 ---------------- */
@@ -88,6 +90,20 @@ class NovelReaderPlugin extends obsidian_1.Plugin {
                 }
                 if (!checking) {
                     this.openPicker(view);
+                }
+                return true;
+            },
+        });
+        this.addCommand({
+            id: 'open-book-shelf',
+            name: '打开书架',
+            checkCallback: (checking) => {
+                const view = this.getActiveReaderView();
+                if (!view) {
+                    return false;
+                }
+                if (!checking) {
+                    new BookshelfModal(this, view).open();
                 }
                 return true;
             },
@@ -159,6 +175,46 @@ class NovelReaderPlugin extends obsidian_1.Plugin {
     }
     openPicker(view) {
         new BookSuggester(this, view).open();
+    }
+    /** 书架：已读过（有进度记录）且仍存在的书，按最近阅读排序 */
+    getShelf() {
+        const entries = [];
+        for (const key of Object.keys(this.data.books)) {
+            const af = this.app.vault.getAbstractFileByPath(key);
+            const progress = this.data.books[key];
+            if (af instanceof obsidian_1.TFolder) {
+                const count = af.children.filter((c) => c instanceof obsidian_1.TFile && c.extension === 'md').length;
+                entries.push({
+                    key,
+                    kind: 'folder',
+                    title: af.name,
+                    detail: `文件夹 · ${count} 篇`,
+                    overall: progress.overall,
+                    updatedAt: progress.updatedAt,
+                });
+            }
+            else if (af instanceof obsidian_1.TFile) {
+                entries.push({
+                    key,
+                    kind: 'file',
+                    title: af.basename,
+                    detail: '单文件',
+                    overall: progress.overall,
+                    updatedAt: progress.updatedAt,
+                });
+            }
+        }
+        return entries.sort((a, b) => b.updatedAt - a.updatedAt);
+    }
+    /** 从书架移除：清掉进度、书签与章节配置（书本身不动） */
+    removeFromShelf(key) {
+        delete this.data.books[key];
+        delete this.data.bookmarks[key];
+        delete this.data.bookConfig[key];
+        if (this.data.lastBook === key) {
+            this.data.lastBook = null;
+        }
+        this.saveSoon();
     }
     getActiveReaderView() {
         const leaves = this.app.workspace.getLeavesOfType(exports.NOVEL_READER_VIEW_TYPE);
@@ -531,10 +587,8 @@ class NovelReaderView extends obsidian_1.ItemView {
         mkBtn('目录', () => this.openToc());
         mkBtn('书签', () => this.toggleBookmark());
         mkBtn('搜索', () => void this.openSearch());
-        mkBtn('换书', () => {
-            this.toggleSheet(false);
-            this.plugin.openPicker(this);
-        });
+        mkBtn('书架', () => this.openBookshelf());
+        mkBtn('换书', () => this.plugin.openPicker(this));
     }
     toggleSheet(force) {
         if (!this.sheetEl) {
@@ -738,7 +792,7 @@ class NovelReaderView extends obsidian_1.ItemView {
     }
     currentAnchor() {
         if (!this.viewportEl) {
-            return { chapter: this.chapterIndex, cid: 0, percent: 0 };
+            return { chapter: this.chapterIndex, cid: 0, percent: 0, overall: 0, updatedAt: 0 };
         }
         const edge = this.viewportEl.scrollLeft + 2;
         let cid = 0;
@@ -751,14 +805,25 @@ class NovelReaderView extends obsidian_1.ItemView {
             }
         }
         const percent = Math.min(1, Math.max(0, this.viewportEl.scrollLeft / this.maxScroll()));
-        return { chapter: this.chapterIndex, cid, percent };
+        return { chapter: this.chapterIndex, cid, percent, overall: 0, updatedAt: 0 };
     }
     saveProgressNow() {
         if (!this.source || !this.viewportEl) {
             return;
         }
-        this.plugin.data.books[this.sourceKey()] = this.currentAnchor();
+        const anchor = this.currentAnchor();
+        anchor.overall = this.overallPercent();
+        anchor.updatedAt = Date.now();
+        this.plugin.data.books[this.sourceKey()] = anchor;
         this.plugin.saveSoon();
+    }
+    /** 全书百分比（按章节进度估算，足够书架展示用） */
+    overallPercent() {
+        if (this.chapters.length === 0) {
+            return 0;
+        }
+        const page = Math.min(this.pageCount, this.currentPageIndex() + 1);
+        return Math.round(((this.chapterIndex + page / this.pageCount) / this.chapters.length) * 100);
     }
     updateStatus() {
         if (!this.statusEl) {
@@ -766,7 +831,7 @@ class NovelReaderView extends obsidian_1.ItemView {
         }
         const page = Math.min(this.pageCount, this.currentPageIndex() + 1);
         const totalChapters = Math.max(1, this.chapters.length);
-        const overall = Math.round(((this.chapterIndex + page / this.pageCount) / totalChapters) * 100);
+        const overall = this.overallPercent();
         this.statusEl.setText(`${this.bookTitle()} · 第 ${this.chapterIndex + 1}/${totalChapters} 章 · ${page}/${this.pageCount} 页 · ${overall}%`);
     }
     async openToc() {
@@ -780,6 +845,14 @@ class NovelReaderView extends obsidian_1.ItemView {
         }));
         this.toggleSheet(false);
         new TocModal(this.app, entries).open();
+    }
+    /** 关闭当前书籍、回到空状态（书架里移除某书后调用） */
+    closeSource() {
+        this.showEmptyState();
+    }
+    openBookshelf() {
+        this.toggleSheet(false);
+        new BookshelfModal(this.plugin, this).open();
     }
     /** 取出某一章的 Markdown 正文（虚拟章按偏移量切片） */
     async chapterText(chapter) {
@@ -965,37 +1038,117 @@ class ReaderSearchModal extends obsidian_1.FuzzySuggestModal {
         }
     }
 }
+/* ---------------- 书架 / 选书 / 搜索 ---------------- */
+/** 书架：继续阅读 + 读过清单（带进度与移除）+ 浏览全库加书 */
+class BookshelfModal extends obsidian_1.Modal {
+    constructor(plugin, view) {
+        super(plugin.app);
+        this.plugin = plugin;
+        this.view = view;
+    }
+    onOpen() {
+        this.contentEl.addClass('nr-shelf');
+        this.titleEl.setText('书架');
+        const shelf = this.plugin.getShelf();
+        const currentKey = this.view.hasSource ? this.view.sourceKey() : null;
+        if (shelf.length === 0) {
+            const hint = this.contentEl.createDiv({ cls: 'nr-shelf-hint' });
+            hint.setText('书架还是空的，从下面浏览库添加一本书吧');
+        }
+        else {
+            for (const entry of shelf) {
+                const row = this.contentEl.createDiv({ cls: 'nr-shelf-item' });
+                const main = row.createDiv({ cls: 'nr-shelf-main' });
+                main.createDiv({ cls: 'nr-shelf-title', text: entry.title });
+                main.createDiv({
+                    cls: 'nr-shelf-meta',
+                    text: `${entry.detail} · 已读 ${entry.overall}%${entry.key === currentKey ? ' · 正在阅读' : ''}`,
+                });
+                const openBtn = row.createEl('button', { cls: 'nr-btn', text: '打开' });
+                openBtn.onclick = () => {
+                    const af = this.app.vault.getAbstractFileByPath(entry.key);
+                    if (af instanceof obsidian_1.TFile) {
+                        void this.view.openSource({ kind: 'file', file: af });
+                    }
+                    else if (af instanceof obsidian_1.TFolder) {
+                        void this.view.openSource({ kind: 'folder', folder: af });
+                    }
+                    else {
+                        new obsidian_1.Notice('这本书已不在库中');
+                    }
+                    this.close();
+                };
+                const delBtn = row.createEl('button', { cls: 'nr-btn nr-btn-danger', text: '移除' });
+                delBtn.onclick = () => {
+                    new ConfirmModal(this.app, '从书架移除', `移除《${entry.title}》的阅读记录、书签与章节配置？`, () => {
+                        this.plugin.removeFromShelf(entry.key);
+                        new obsidian_1.Notice(`已移除《${entry.title}》`);
+                        if (this.view.hasSource && this.view.sourceKey() === entry.key) {
+                            void this.view.closeSource();
+                        }
+                        this.close();
+                    }).open();
+                };
+            }
+        }
+        const actions = this.contentEl.createDiv({ cls: 'nr-shelf-actions' });
+        const browseBtn = actions.createEl('button', { cls: 'nr-btn nr-btn-primary', text: '浏览全库添加书籍' });
+        browseBtn.onclick = () => {
+            const targetView = this.view;
+            this.close();
+            new BookSuggester(this.plugin, targetView).open();
+        };
+    }
+}
+class ConfirmModal extends obsidian_1.Modal {
+    constructor(app, title, message, onConfirm) {
+        super(app);
+        this.title = title;
+        this.message = message;
+        this.onConfirm = onConfirm;
+    }
+    onOpen() {
+        this.titleEl.setText(this.title);
+        this.contentEl.createDiv({ cls: 'nr-confirm-text', text: this.message });
+        const row = this.contentEl.createDiv({ cls: 'nr-pick-actions' });
+        const cancel = row.createEl('button', { cls: 'nr-btn', text: '取消' });
+        cancel.onclick = () => this.close();
+        const ok = row.createEl('button', { cls: 'nr-btn nr-btn-danger', text: '确认移除' });
+        ok.onclick = () => {
+            this.onConfirm();
+            this.close();
+        };
+    }
+}
 class BookSuggester extends obsidian_1.FuzzySuggestModal {
     constructor(plugin, view) {
         super(plugin.app);
+        this.plugin = plugin;
         this.view = view;
-        this.setPlaceholder('搜索书名（文件或文件夹）…');
+        this.setPlaceholder('浏览库添加书籍（根目录书籍与文件夹）…');
     }
+    /** 只列根目录下的书籍，避免把设定表和杂物 md 混进来 */
     getItems() {
         const items = [];
-        for (const file of this.app.vault.getMarkdownFiles()) {
-            items.push({ kind: 'file', file });
-        }
-        const walk = (folder) => {
-            for (const child of folder.children) {
-                if (child instanceof obsidian_1.TFolder && !child.name.startsWith('.')) {
-                    const hasMd = child.children.some((c) => c instanceof obsidian_1.TFile && c.extension === 'md');
-                    if (hasMd) {
-                        items.push({ kind: 'folder', folder: child });
-                    }
-                    walk(child);
-                }
+        for (const child of this.app.vault.getRoot().children) {
+            if (child instanceof obsidian_1.TFile && child.extension === 'md') {
+                items.push({ kind: 'file', file: child });
             }
-        };
-        walk(this.app.vault.getRoot());
+            else if (child instanceof obsidian_1.TFolder && !child.name.startsWith('.') && folderHasMd(child)) {
+                items.push({ kind: 'folder', folder: child });
+            }
+        }
         return items;
     }
     getItemText(item) {
+        const path = item.kind === 'file' ? item.file.path : item.folder.path;
+        const name = item.kind === 'file' ? item.file.basename : item.folder.name;
+        const stored = this.plugin.data.books[path];
+        const prefix = stored ? `已读 ${stored.overall}% · ` : '';
         if (item.kind === 'file') {
-            const parentPath = item.file.parent ? item.file.parent.path : '';
-            return `${item.file.basename} ${parentPath}`;
+            return `${prefix}${name} · 单文件`;
         }
-        return `${item.folder.name}（文件夹） ${item.folder.parent ? item.folder.parent.path : ''}`;
+        return `${prefix}${name} · 文件夹 · ${countMd(item.folder)} 篇`;
     }
     onChooseItem(item) {
         if (item.kind === 'file') {
@@ -1005,6 +1158,21 @@ class BookSuggester extends obsidian_1.FuzzySuggestModal {
             void this.view.openSource({ kind: 'folder', folder: item.folder });
         }
     }
+}
+function countMd(folder) {
+    let n = 0;
+    for (const child of folder.children) {
+        if (child instanceof obsidian_1.TFile && child.extension === 'md') {
+            n += 1;
+        }
+        else if (child instanceof obsidian_1.TFolder) {
+            n += countMd(child);
+        }
+    }
+    return n;
+}
+function folderHasMd(folder) {
+    return countMd(folder) > 0;
 }
 class TocModal extends obsidian_1.Modal {
     constructor(app, entries) {

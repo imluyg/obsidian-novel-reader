@@ -126,7 +126,50 @@
   cursor: pointer;
 }
 
-/* ---------- 目录弹窗 ---------- */
+/* ---------- 书架 ---------- */
+.nr-shelf-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 4px;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.nr-shelf-main {
+  flex: 1;
+  min-width: 0;
+}
+.nr-shelf-title {
+  font-size: var(--font-ui-medium);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.nr-shelf-meta {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+}
+.nr-shelf-hint {
+  padding: 12px 4px;
+  color: var(--text-muted);
+}
+.nr-shelf-actions {
+  margin-top: 14px;
+  display: flex;
+  justify-content: flex-end;
+}
+.nr-btn-danger {
+  color: var(--text-error);
+  border-color: var(--background-modifier-border);
+}
+.nr-btn-danger:hover {
+  background: var(--background-modifier-error);
+}
+.nr-confirm-text {
+  margin: 8px 0 4px;
+  line-height: 1.6;
+}
+
+/* ---------- 选书与目录弹窗 ---------- */
 .nr-toc {
   display: flex;
   flex-direction: column;
