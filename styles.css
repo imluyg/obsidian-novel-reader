@@ -194,6 +194,15 @@
 .nr-toc-item:hover {
   background: var(--background-modifier-hover);
 }
+/* 目录中当前正在读的这一章 */
+.nr-toc-item.nr-toc-current {
+  background: var(--background-modifier-hover);
+  color: var(--text-accent);
+  font-weight: 600;
+}
+.nr-toc-item.nr-toc-current:hover {
+  background: var(--background-modifier-hover);
+}
 .nr-toc-l1 { padding-left: 10px; }
 .nr-toc-l2 { padding-left: 26px; }
 .nr-toc-l3 { padding-left: 42px; }

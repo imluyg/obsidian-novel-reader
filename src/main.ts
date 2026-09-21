@@ -14,6 +14,8 @@ import {
   Modal,
   Notice,
   Plugin,
+  PluginSettingTab,
+  Setting,
   TAbstractFile,
   TFile,
   TFolder,
@@ -30,11 +32,24 @@ const FONT_MAX = 30;
 const LH_MIN = 1.4;
 const LH_MAX = 2.6;
 
+export type ThemeName = 'auto' | 'sepia' | 'dark';
+
 export interface ReaderSettings {
   fontSize: number;
   lineHeight: number;
-  theme: 'auto' | 'sepia' | 'dark';
+  theme: ThemeName;
   immersive: boolean;
+  /** 每本书独立记住字号/行距/主题，不被其他书的调整带走 */
+  perBookTypography: boolean;
+  /** 选书器是否递归进入子文件夹里的书 */
+  deepBrowse: boolean;
+}
+
+/** 字号 / 行距 / 主题三件套 */
+export interface Typography {
+  fontSize: number;
+  lineHeight: number;
+  theme: ThemeName;
 }
 
 export interface BookProgress {
@@ -73,14 +88,24 @@ export interface PluginData {
   books: Record<string, BookProgress>;
   bookConfig: Record<string, BookConfig>;
   bookmarks: Record<string, BookmarkItem[]>;
+  /** 每本书覆盖全局默认的排版，空对象表示全部沿用默认值 */
+  bookStyle: Record<string, Partial<Typography>>;
 }
 
 const DEFAULTS: PluginData = {
-  settings: { fontSize: 17, lineHeight: 1.9, theme: 'auto', immersive: true },
+  settings: {
+    fontSize: 17,
+    lineHeight: 1.9,
+    theme: 'auto',
+    immersive: true,
+    perBookTypography: true,
+    deepBrowse: true,
+  },
   lastBook: null,
   books: {},
   bookConfig: {},
   bookmarks: {},
+  bookStyle: {},
 };
 
 /** 兼容旧版本（v0.3.0 及以前）的进度结构：缺 chapter 字段时兜底为第 0 章 */
@@ -130,6 +155,7 @@ export default class NovelReaderPlugin extends Plugin {
       books: (loaded && loaded.books) || {},
       bookConfig: (loaded && loaded.bookConfig) || {},
       bookmarks: (loaded && loaded.bookmarks) || {},
+      bookStyle: (loaded && loaded.bookStyle) || {},
     };
     // 把历史数据（可能缺 chapter 字段）统一规范化，避免老版本升级后定位异常
     for (const key of Object.keys(this.data.books)) {
@@ -144,6 +170,8 @@ export default class NovelReaderPlugin extends Plugin {
     this.registerView(NOVEL_READER_VIEW_TYPE, (leaf: WorkspaceLeaf) => {
       return new NovelReaderView(leaf, this);
     });
+
+    this.addSettingTab(new NovelReaderSettingTab(this.app, this));
 
     this.addRibbonIcon('book-open', '小说阅读器', () => {
       void this.openReader();
@@ -296,6 +324,7 @@ export default class NovelReaderPlugin extends Plugin {
     delete this.data.books[key];
     delete this.data.bookmarks[key];
     delete this.data.bookConfig[key];
+    delete this.data.bookStyle[key];
     if (this.data.lastBook === key) {
       this.data.lastBook = null;
     }
@@ -320,6 +349,10 @@ export default class NovelReaderPlugin extends Plugin {
       d.bookConfig[newPath] = d.bookConfig[oldPath];
       delete d.bookConfig[oldPath];
     }
+    if (d.bookStyle[oldPath]) {
+      d.bookStyle[newPath] = d.bookStyle[oldPath];
+      delete d.bookStyle[oldPath];
+    }
     if (d.lastBook === oldPath) {
       d.lastBook = newPath;
     }
@@ -342,7 +375,49 @@ export default class NovelReaderPlugin extends Plugin {
     }
   }
 
-  private getActiveReaderView(): NovelReaderView | null {
+  /** 设置面板改动排版：开了「每本书独立」就只作用于当前这本书，否则改全局默认 */
+  public applyTypography(patch: Partial<Typography>): void {
+    const view = this.getActiveReaderView();
+    if (view && view.hasSource && this.data.settings.perBookTypography) {
+      view.setTypography(patch);
+      view.refreshTypography();
+      return;
+    }
+    const s = this.data.settings;
+    if (patch.fontSize !== undefined) {
+      s.fontSize = patch.fontSize;
+    }
+    if (patch.lineHeight !== undefined) {
+      s.lineHeight = patch.lineHeight;
+    }
+    if (patch.theme !== undefined) {
+      s.theme = patch.theme;
+    }
+    this.saveSoon();
+    this.refreshReaderViews();
+  }
+
+  /** 清掉某本书的独立排版记忆，不传 key 则全部清空 */
+  public clearBookStyle(key?: string): void {
+    if (key) {
+      delete this.data.bookStyle[key];
+    } else {
+      this.data.bookStyle = {};
+    }
+    this.saveSoon();
+    this.refreshReaderViews();
+  }
+
+  /** 让已打开的阅读器按当前设置重排 */
+  public refreshReaderViews(): void {
+    for (const leaf of this.app.workspace.getLeavesOfType(NOVEL_READER_VIEW_TYPE)) {
+      if (leaf.view instanceof NovelReaderView) {
+        leaf.view.refreshTypography();
+      }
+    }
+  }
+
+  public getActiveReaderView(): NovelReaderView | null {
     const leaves = this.app.workspace.getLeavesOfType(NOVEL_READER_VIEW_TYPE);
     for (const leaf of leaves) {
       if (leaf.view instanceof NovelReaderView) {
@@ -471,6 +546,10 @@ export class NovelReaderView extends ItemView {
   private sheetEl: HTMLElement | null = null;
   private themeBtnEl: HTMLElement | null = null;
   private cidEls: HTMLElement[] = [];
+  /** chapters 每次重建都自增，用来作废还在跑的搜索索引构建 */
+  private chaptersVersion = 0;
+  private indexVersion = -1;
+  private chapterTexts: string[] = [];
   private pageCount = 1;
   private ro: ResizeObserver | null = null;
   private scrollRaf = 0;
@@ -621,6 +700,7 @@ export class NovelReaderView extends ItemView {
     }
 
     this.chapters = await this.buildChapters(files);
+    this.chaptersVersion += 1;
     if (this.chapters.length === 0) {
       new Notice('这本书还没有可读内容');
       this.showEmptyState();
@@ -895,27 +975,72 @@ export class NovelReaderView extends ItemView {
 
   /* ---------- 排版与主题 ---------- */
 
-  private changeFont(delta: number): void {
+  /** 当前生效的排版：开了「每本书独立」就优先用这本书自己记住的那套 */
+  public currentTypography(): Typography {
     const s = this.plugin.data.settings;
-    s.fontSize = Math.min(FONT_MAX, Math.max(FONT_MIN, s.fontSize + delta));
+    const own =
+      s.perBookTypography && this.source
+        ? this.plugin.data.bookStyle[this.sourceKey()]
+        : undefined;
+    return {
+      fontSize: (own && own.fontSize) || s.fontSize,
+      lineHeight: (own && own.lineHeight) || s.lineHeight,
+      theme: (own && own.theme) || s.theme,
+    };
+  }
+
+  /** 写排版：开了「每本书独立」写进这本书，否则写全局默认 */
+  public setTypography(patch: Partial<Typography>): void {
+    const s = this.plugin.data.settings;
+    if (s.perBookTypography && this.source) {
+      const key = this.sourceKey();
+      this.plugin.data.bookStyle[key] = {
+        ...(this.plugin.data.bookStyle[key] || {}),
+        ...patch,
+      };
+    } else {
+      if (patch.fontSize !== undefined) {
+        s.fontSize = patch.fontSize;
+      }
+      if (patch.lineHeight !== undefined) {
+        s.lineHeight = patch.lineHeight;
+      }
+      if (patch.theme !== undefined) {
+        s.theme = patch.theme;
+      }
+    }
     this.plugin.saveSoon();
+  }
+
+  /** 排版变化后按当前锚点重排 */
+  public refreshTypography(): void {
+    this.applySettings();
+    this.reflow();
+  }
+
+  private changeFont(delta: number): void {
+    const t = this.currentTypography();
+    this.setTypography({
+      fontSize: Math.min(FONT_MAX, Math.max(FONT_MIN, t.fontSize + delta)),
+    });
     this.reflow();
   }
 
   private changeLineHeight(delta: number): void {
-    const s = this.plugin.data.settings;
-    s.lineHeight = Math.min(LH_MAX, Math.max(LH_MIN, Math.round((s.lineHeight + delta) * 10) / 10));
-    this.plugin.saveSoon();
+    const t = this.currentTypography();
+    this.setTypography({
+      lineHeight: Math.min(LH_MAX, Math.max(LH_MIN, Math.round((t.lineHeight + delta) * 10) / 10)),
+    });
     this.reflow();
   }
 
   /** 捏合过程中实时应用字号（rAF 节流重排，抬手时才落盘） */
   private applyFontSizeLive(size: number): void {
-    const s = this.plugin.data.settings;
-    if (s.fontSize === size) {
+    const t = this.currentTypography();
+    if (t.fontSize === size) {
       return;
     }
-    s.fontSize = size;
+    this.setTypography({ fontSize: size });
     this.contentEl.style.setProperty('--nr-font', `${size}px`);
     if (this.pinchRaf) {
       window.cancelAnimationFrame(this.pinchRaf);
@@ -928,9 +1053,8 @@ export class NovelReaderView extends ItemView {
 
   private cycleTheme(): void {
     const order: Array<'auto' | 'sepia' | 'dark'> = ['auto', 'sepia', 'dark'];
-    const s = this.plugin.data.settings;
-    s.theme = order[(order.indexOf(s.theme) + 1) % order.length];
-    this.plugin.saveSoon();
+    const t = this.currentTypography();
+    this.setTypography({ theme: order[(order.indexOf(t.theme) + 1) % order.length] });
     if (this.themeBtnEl) {
       this.themeBtnEl.setText(this.themeLabel());
     }
@@ -938,7 +1062,7 @@ export class NovelReaderView extends ItemView {
   }
 
   private themeLabel(): string {
-    const t = this.plugin.data.settings.theme;
+    const t = this.currentTypography().theme;
     return t === 'auto' ? '跟随主题' : t === 'sepia' ? '米色' : '暗黑';
   }
 
@@ -964,15 +1088,15 @@ export class NovelReaderView extends ItemView {
   }
 
   private applyTheme(): void {
-    const theme = this.plugin.data.settings.theme;
+    const theme = this.currentTypography().theme;
     this.contentEl.toggleClass('nr-sepia', theme === 'sepia');
     this.contentEl.toggleClass('nr-dark', theme === 'dark');
   }
 
   private applySettings(): void {
-    const s = this.plugin.data.settings;
-    this.contentEl.style.setProperty('--nr-font', `${s.fontSize}px`);
-    this.contentEl.style.setProperty('--nr-lh', String(s.lineHeight));
+    const t = this.currentTypography();
+    this.contentEl.style.setProperty('--nr-font', `${t.fontSize}px`);
+    this.contentEl.style.setProperty('--nr-lh', String(t.lineHeight));
     if (this.themeBtnEl) {
       this.themeBtnEl.setText(this.themeLabel());
     }
@@ -1189,7 +1313,7 @@ export class NovelReaderView extends ItemView {
       onClick: () => void this.loadChapter(i, { page: 0 }),
     }));
     this.toggleSheet(false);
-    new TocModal(this.app, entries).open();
+    new TocModal(this.app, entries, this.chapterIndex).open();
   }
 
   /** 关闭当前书籍、回到空状态（书架里移除某书后调用） */
@@ -1239,17 +1363,34 @@ export class NovelReaderView extends ItemView {
     this.toggleSheet(false);
   }
 
-  /** 书内搜索：预先取出各章正文，交给搜索弹窗 */
-  private async openSearch(): Promise<void> {
+  /** 搜索索引：按章读但可以边读边搜，避免全书一次性读进内存时卡住 */
+  private ensureIndex(): void {
+    if (this.indexVersion === this.chaptersVersion) {
+      return;
+    }
+    const version = this.chaptersVersion;
+    this.indexVersion = version;
+    this.chapterTexts = new Array<string>(this.chapters.length).fill('');
+    void this.buildIndex(version);
+  }
+
+  private async buildIndex(version: number): Promise<void> {
+    for (let i = 0; i < this.chapters.length; i++) {
+      if (this.chaptersVersion !== version) {
+        return;
+      }
+      this.chapterTexts[i] = await this.chapterText(this.chapters[i]);
+    }
+  }
+
+  /** 书内搜索：弹窗立即打开，索引在后台陆续补齐 */
+  private openSearch(): void {
     if (this.chapters.length === 0) {
       return;
     }
-    const texts: string[] = [];
-    for (const chapter of this.chapters) {
-      texts.push(await this.chapterText(chapter));
-    }
     this.toggleSheet(false);
-    new ReaderSearchModal(this.app, this, this.chapters, texts).open();
+    this.ensureIndex();
+    new ReaderSearchModal(this.app, this, this.chapters, this.chapterTexts).open();
   }
 
   /** 跳到某章，并定位到首个包含指定文字的段落 */
@@ -1282,6 +1423,8 @@ export class NovelReaderView extends ItemView {
     this.source = null;
     this.openPath = '';
     this.chapters = [];
+    this.chaptersVersion += 1;
+    this.chapterTexts = [];
     this.chapterIndex = 0;
     this.cidEls = [];
     this.pageCount = 1;
@@ -1442,6 +1585,9 @@ class ReaderSearchModal extends FuzzySuggestModal<FindItem> {
     const lower = query.toLowerCase();
     const out: FindItem[] = [];
     for (let i = 0; i < this.texts.length && out.length < 60; i++) {
+      if (!this.texts[i]) {
+        continue;
+      }
       const hay = this.texts[i].toLowerCase();
       let pos = hay.indexOf(lower);
       while (pos >= 0 && out.length < 60) {
@@ -1585,31 +1731,41 @@ class BookSuggester extends FuzzySuggestModal<PickItem> {
     super(plugin.app);
     this.plugin = plugin;
     this.view = view;
-    this.setPlaceholder('浏览库添加书籍（根目录书籍与文件夹）…');
+    this.setPlaceholder('搜索书籍（文件路径 / 书名均可）…');
   }
 
-  /** 只列根目录下的书籍，避免把设定表和杂物 md 混进来 */
+  /** 列出可选的书：默认递归进子文件夹，设置里可以关掉只留根目录 */
   public getItems(): PickItem[] {
+    const deep = this.plugin.data.settings.deepBrowse;
     const items: PickItem[] = [];
-    for (const child of this.app.vault.getRoot().children) {
-      if (child instanceof TFile && child.extension === 'md') {
-        items.push({ kind: 'file', file: child });
-      } else if (child instanceof TFolder && !child.name.startsWith('.') && folderHasMd(child)) {
-        items.push({ kind: 'folder', folder: child });
+    const walk = (folder: TFolder): void => {
+      for (const child of folder.children) {
+        if (child instanceof TFile) {
+          if (child.extension === 'md' && !isEmptyFile(child)) {
+            items.push({ kind: 'file', file: child });
+          }
+        } else if (child instanceof TFolder && !child.name.startsWith('.') && folderHasMd(child)) {
+          items.push({ kind: 'folder', folder: child });
+          if (deep) {
+            walk(child);
+          }
+        }
       }
-    }
+    };
+    walk(this.app.vault.getRoot());
     return items;
   }
 
   public getItemText(item: PickItem): string {
     const path = item.kind === 'file' ? item.file.path : item.folder.path;
-    const name = item.kind === 'file' ? item.file.basename : item.folder.name;
+    // 带上路径，递归浏览时能分清同名章节文件在哪一层
+    const label = path.replace(/\.md$/, '');
     const stored = this.plugin.data.books[path];
     const prefix = stored ? `已读 ${stored.overall}% · ` : '';
     if (item.kind === 'file') {
-      return `${prefix}${name} · 单文件`;
+      return `${prefix}${label} · 单文件`;
     }
-    return `${prefix}${name} · 文件夹 · ${countMd(item.folder)} 篇`;
+    return `${prefix}${label} · 文件夹 · ${countMd(item.folder)} 篇`;
   }
 
   public onChooseItem(item: PickItem): void {
@@ -1641,24 +1797,185 @@ function folderHasMd(folder: TFolder): boolean {
 
 class TocModal extends Modal {
   private readonly entries: TocEntry[];
+  private readonly currentIndex: number;
 
-  constructor(app: App, entries: TocEntry[]) {
+  constructor(app: App, entries: TocEntry[], currentIndex: number) {
     super(app);
     this.entries = entries;
+    this.currentIndex = currentIndex;
   }
 
   public onOpen(): void {
     this.contentEl.addClass('nr-toc');
     this.titleEl.setText('目录');
-    for (const entry of this.entries) {
+    let currentEl: HTMLElement | null = null;
+    for (let i = 0; i < this.entries.length; i++) {
+      const entry = this.entries[i];
       const btn = this.contentEl.createEl('button', {
         cls: `nr-toc-item nr-toc-l${Math.min(entry.level, 4)}`,
         text: entry.label,
       });
+      if (i === this.currentIndex) {
+        btn.addClass('nr-toc-current');
+        currentEl = btn;
+      }
       btn.onclick = () => {
         entry.onClick();
         this.close();
       };
     }
+    // 目录很长时把当前章滚到可见处
+    if (currentEl) {
+      const el = currentEl;
+      window.setTimeout(() => {
+        try {
+          el.scrollIntoView({ block: 'center' });
+        } catch {
+          el.scrollIntoView();
+        }
+      }, 0);
+    }
+  }
+}
+
+/* ---------------- 设置面板 ---------------- */
+
+class NovelReaderSettingTab extends PluginSettingTab {
+  private readonly plugin: NovelReaderPlugin;
+
+  constructor(app: App, plugin: NovelReaderPlugin) {
+    super(app, plugin);
+    this.plugin = plugin;
+  }
+
+  public display(): void {
+    const { containerEl } = this;
+    containerEl.empty();
+    const settings = this.plugin.data.settings;
+    const view = this.plugin.getActiveReaderView();
+    const perBookHere = settings.perBookTypography && !!view && view.hasSource;
+    const current = perBookHere && view ? view.currentTypography() : null;
+
+    new Setting(containerEl).setName('排版').setHeading();
+    containerEl.createEl('p', {
+      cls: 'setting-item-description',
+      text: perBookHere
+        ? '「每本书独立排版」已开启：下面的字号 / 行距 / 主题改的是当前正在读的这本。'
+        : '下面的字号 / 行距 / 主题是全局默认值，新书会先套用这套。',
+    });
+
+    new Setting(containerEl)
+      .setName('字号')
+      .setDesc(`${current ? current.fontSize : settings.fontSize} px（${FONT_MIN}–${FONT_MAX}）`)
+      .addSlider((slider) => {
+        slider
+          .setLimits(FONT_MIN, FONT_MAX, 1)
+          .setDynamicTooltip()
+          .setValue(current ? current.fontSize : settings.fontSize)
+          .onChange((value) => {
+            this.plugin.applyTypography({ fontSize: value });
+          });
+      });
+
+    new Setting(containerEl)
+      .setName('行距')
+      .setDesc(
+        `${(current ? current.lineHeight : settings.lineHeight).toFixed(1)}（${LH_MIN}–${LH_MAX}）`
+      )
+      .addSlider((slider) => {
+        slider
+          .setLimits(LH_MIN, LH_MAX, 0.1)
+          .setDynamicTooltip()
+          .setValue(current ? current.lineHeight : settings.lineHeight)
+          .onChange((value) => {
+            this.plugin.applyTypography({ lineHeight: Math.round(value * 10) / 10 });
+          });
+      });
+
+    new Setting(containerEl)
+      .setName('主题')
+      .setDesc('跟随 Obsidian / 米色护眼 / 暗黑')
+      .addDropdown((drop) => {
+        drop
+          .addOption('auto', '跟随主题')
+          .addOption('sepia', '米色')
+          .addOption('dark', '暗黑')
+          .setValue(current ? current.theme : settings.theme)
+          .onChange((value) => {
+            this.plugin.applyTypography({ theme: value as ThemeName });
+          });
+      });
+
+    new Setting(containerEl)
+      .setName('每本书独立排版')
+      .setDesc('开启后，某本书里调好的字号主题不会被另一本书带走')
+      .addToggle((toggle) => {
+        toggle.setValue(settings.perBookTypography).onChange((value) => {
+          settings.perBookTypography = value;
+          this.plugin.saveSoon();
+          this.plugin.refreshReaderViews();
+          this.display();
+        });
+      });
+
+    if (perBookHere && view) {
+      new Setting(containerEl)
+        .setName('重置当前这本书的排版')
+        .setDesc('让它重新沿用上面的默认值')
+        .addButton((btn) => {
+          btn.setButtonText('重置').onClick(() => {
+            this.plugin.clearBookStyle(view.sourceKey());
+            new Notice('这本书已恢复默认排版');
+            this.display();
+          });
+        });
+    }
+
+    new Setting(containerEl).setName('阅读').setHeading();
+
+    new Setting(containerEl)
+      .setName('沉浸模式')
+      .setDesc('隐藏 Obsidian 标题栏与移动端导航栏')
+      .addToggle((toggle) => {
+        toggle.setValue(settings.immersive).onChange((value) => {
+          settings.immersive = value;
+          this.plugin.saveSoon();
+          this.plugin.refreshReaderViews();
+          this.display();
+        });
+      });
+
+    new Setting(containerEl).setName('书库').setHeading();
+
+    new Setting(containerEl)
+      .setName('递归浏览书库')
+      .setDesc('选书时一并列出子文件夹里的书籍；关掉则只列库根目录')
+      .addToggle((toggle) => {
+        toggle.setValue(settings.deepBrowse).onChange((value) => {
+          settings.deepBrowse = value;
+          this.plugin.saveSoon();
+        });
+      });
+
+    new Setting(containerEl)
+      .setName('清除所有书的排版记忆')
+      .setDesc('全部恢复默认值，书签与阅读进度不受影响')
+      .addButton((btn) => {
+        btn
+          .setWarning()
+          .setButtonText('清除')
+          .onClick(() => {
+            new ConfirmModal(
+              this.app,
+              '清除排版记忆',
+              '清除所有书籍单独保存的字号 / 行距 / 主题？书签与阅读进度会保留。',
+              () => {
+                this.plugin.clearBookStyle();
+                new Notice('已清除所有书的排版记忆');
+                this.display();
+              }
+            ).open();
+          });
+      });
   }
 }
