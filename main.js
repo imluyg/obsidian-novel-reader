@@ -392,11 +392,6 @@ class NovelReaderView extends obsidian_1.ItemView {
             return;
         }
         this.chapters = await this.buildChapters(files);
-        if (this.chapters.length === 0) {
-            new obsidian_1.Notice('这本书没有可渲染的内容');
-            this.showEmptyState();
-            return;
-        }
         this.contentEl.empty();
         this.contentEl.addClass('novel-reader');
         this.buildShell();
@@ -425,13 +420,17 @@ class NovelReaderView extends obsidian_1.ItemView {
         const cfg = this.plugin.data.bookConfig[folder.path];
         if (cfg && cfg.files.length > 0) {
             const wanted = new Set(cfg.files);
-            return all.filter((f) => wanted.has(f.name));
+            // 兼容旧配置：既支持相对路径，也支持纯文件名
+            const matched = all.filter((f) => wanted.has(relPath(folder, f)) || wanted.has(f.name));
+            if (matched.length > 0) {
+                return matched;
+            }
         }
         const picked = await pickChapters(this.app, folder, all);
         if (picked.length === 0) {
             return [];
         }
-        this.plugin.data.bookConfig[folder.path] = { files: picked.map((f) => f.name) };
+        this.plugin.data.bookConfig[folder.path] = { files: picked.map((f) => relPath(folder, f)) };
         this.plugin.saveSoon();
         return picked;
     }
@@ -440,7 +439,11 @@ class NovelReaderView extends obsidian_1.ItemView {
         const chapters = [];
         if (this.source && this.source.kind === 'folder') {
             for (const file of files) {
-                chapters.push({ file, title: file.basename, level: 1 });
+                chapters.push({
+                    file,
+                    title: relativeLabel(this.source.folder, file),
+                    level: 1,
+                });
             }
             return chapters;
         }
@@ -944,9 +947,44 @@ class NovelReaderView extends obsidian_1.ItemView {
     }
 }
 exports.NovelReaderView = NovelReaderView;
+/** 按路径分段做自然排序：`第一卷/第2章.md` 排在 `第二卷/第1章.md` 前面 */
+function comparePaths(a, b) {
+    const as = a.split('/');
+    const bs = b.split('/');
+    const n = Math.min(as.length, bs.length);
+    for (let i = 0; i < n; i++) {
+        const cmp = naturalCompare(as[i], bs[i]);
+        if (cmp !== 0) {
+            return cmp;
+        }
+    }
+    return as.length - bs.length;
+}
+/** 递归收集文件夹下的所有 Markdown（含子文件夹），按路径排序 */
 function listChapterFiles(folder) {
-    const files = folder.children.filter((c) => c instanceof obsidian_1.TFile && c.extension === 'md');
-    return files.sort((a, b) => naturalCompare(a.name, b.name));
+    const found = [];
+    const walk = (current) => {
+        for (const child of current.children) {
+            if (child instanceof obsidian_1.TFile && child.extension === 'md') {
+                found.push(child);
+            }
+            else if (child instanceof obsidian_1.TFolder) {
+                walk(child);
+            }
+        }
+    };
+    walk(folder);
+    return found.sort((a, b) => comparePaths(a.path, b.path));
+}
+/** 章节相对书根的路径标签，如 `左道/术法` */
+function relativeLabel(root, file) {
+    const prefix = root.path + '/';
+    const rel = file.path.startsWith(prefix) ? file.path.slice(prefix.length) : file.name;
+    return rel.replace(/\.md$/, '');
+}
+function relPath(root, file) {
+    const prefix = root.path + '/';
+    return file.path.startsWith(prefix) ? file.path.slice(prefix.length) : file.name;
 }
 /** 首次打开文件夹书：让用户勾选哪些文件算章节。 */
 function pickChapters(app, folder, files) {
@@ -961,7 +999,7 @@ function pickChapters(app, folder, files) {
             const cb = row.createEl('input', { type: 'checkbox' });
             cb.checked = chapterLike(f.name);
             checks.push(cb);
-            row.createSpan({ text: f.name });
+            row.createSpan({ text: relativeLabel(folder, f) });
         }
         const actions = modal.contentEl.createDiv({ cls: 'nr-pick-actions' });
         const allBtn = actions.createEl('button', { cls: 'nr-btn', text: '全选' });
