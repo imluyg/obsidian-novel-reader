@@ -42,6 +42,13 @@ export interface BookProgress {
   percent: number;
 }
 
+export interface BookmarkItem {
+  chapter: number;
+  cid: number;
+  percent: number;
+  excerpt: string;
+}
+
 export interface BookConfig {
   files: string[];
 }
@@ -51,6 +58,7 @@ export interface PluginData {
   lastBook: string | null;
   books: Record<string, BookProgress>;
   bookConfig: Record<string, BookConfig>;
+  bookmarks: Record<string, BookmarkItem[]>;
 }
 
 const DEFAULTS: PluginData = {
@@ -58,7 +66,24 @@ const DEFAULTS: PluginData = {
   lastBook: null,
   books: {},
   bookConfig: {},
+  bookmarks: {},
 };
+
+/** 兼容旧版本（v0.3.0 及以前）的进度结构：缺 chapter 字段时兜底为第 0 章 */
+function normalizeProgress(raw: unknown): BookProgress | null {
+  if (!raw || typeof raw !== 'object') {
+    return null;
+  }
+  const rec = raw as Record<string, unknown>;
+  const num = (v: unknown, fallback: number): number => {
+    return typeof v === 'number' && Number.isFinite(v) ? v : fallback;
+  };
+  return {
+    chapter: Math.max(0, Math.floor(num(rec.chapter, 0))),
+    cid: Math.max(0, Math.floor(num(rec.cid, 0))),
+    percent: Math.min(1, Math.max(0, num(rec.percent, 0))),
+  };
+}
 
 interface RenderChapter {
   file: TFile;
@@ -88,7 +113,17 @@ export default class NovelReaderPlugin extends Plugin {
       lastBook: (loaded && loaded.lastBook) || null,
       books: (loaded && loaded.books) || {},
       bookConfig: (loaded && loaded.bookConfig) || {},
+      bookmarks: (loaded && loaded.bookmarks) || {},
     };
+    // 把历史数据（可能缺 chapter 字段）统一规范化，避免老版本升级后定位异常
+    for (const key of Object.keys(this.data.books)) {
+      const fixed = normalizeProgress(this.data.books[key]);
+      if (fixed) {
+        this.data.books[key] = fixed;
+      } else {
+        delete this.data.books[key];
+      }
+    }
 
     this.registerView(NOVEL_READER_VIEW_TYPE, (leaf: WorkspaceLeaf) => {
       return new NovelReaderView(leaf, this);
@@ -423,7 +458,7 @@ export class NovelReaderView extends ItemView {
     });
     this.ro.observe(this.viewportEl!);
 
-    const progress = this.plugin.data.books[this.sourceKey()];
+    const progress = normalizeProgress(this.plugin.data.books[this.sourceKey()]);
     const index = progress
       ? Math.min(this.chapters.length - 1, Math.max(0, progress.chapter))
       : 0;
@@ -634,6 +669,8 @@ export class NovelReaderView extends ItemView {
     this.themeBtnEl = mkBtn(this.themeLabel(), () => this.cycleTheme());
     mkBtn(this.immersiveLabel(), () => this.toggleImmersive());
     mkBtn('目录', () => this.openToc());
+    mkBtn('书签', () => this.toggleBookmark());
+    mkBtn('搜索', () => void this.openSearch());
     mkBtn('换书', () => {
       this.toggleSheet(false);
       this.plugin.openPicker(this);
@@ -908,7 +945,7 @@ export class NovelReaderView extends ItemView {
     );
   }
 
-  private openToc(): void {
+  private async openToc(): Promise<void> {
     if (this.chapters.length === 0) {
       return;
     }
@@ -919,6 +956,80 @@ export class NovelReaderView extends ItemView {
     }));
     this.toggleSheet(false);
     new TocModal(this.app, entries).open();
+  }
+
+  /** 取出某一章的 Markdown 正文（虚拟章按偏移量切片） */
+  private async chapterText(chapter: RenderChapter): Promise<string> {
+    const text = await this.app.vault.cachedRead(chapter.file);
+    if (chapter.start !== undefined && chapter.end !== undefined) {
+      return text.slice(chapter.start, chapter.end);
+    }
+    return text;
+  }
+
+  /** 书签：在当前位置添加/移除（同一位置再点一次即移除） */
+  private toggleBookmark(): void {
+    if (!this.source) {
+      return;
+    }
+    const key = this.sourceKey();
+    const anchor = this.currentAnchor();
+    const list = this.plugin.data.bookmarks[key] || [];
+    const hit = list.findIndex(
+      (b) => b.chapter === anchor.chapter && Math.abs(b.percent - anchor.percent) < 0.005
+    );
+    if (hit >= 0) {
+      list.splice(hit, 1);
+      new Notice('已移除书签');
+    } else {
+      const anchorEl = this.cidEls[anchor.cid];
+      const raw = anchorEl ? anchorEl.getText() : '';
+      const excerpt = raw.replace(/\s+/g, ' ').slice(0, 24) || this.chapters[anchor.chapter].title;
+      list.push({ chapter: anchor.chapter, cid: anchor.cid, percent: anchor.percent, excerpt });
+      new Notice(`已添加书签：${excerpt}`);
+    }
+    this.plugin.data.bookmarks[key] = list;
+    this.plugin.saveSoon();
+    this.toggleSheet(false);
+  }
+
+  /** 书内搜索：预先取出各章正文，交给搜索弹窗 */
+  private async openSearch(): Promise<void> {
+    if (this.chapters.length === 0) {
+      return;
+    }
+    const texts: string[] = [];
+    for (const chapter of this.chapters) {
+      texts.push(await this.chapterText(chapter));
+    }
+    this.toggleSheet(false);
+    new ReaderSearchModal(this.app, this, this.chapters, texts).open();
+  }
+
+  /** 跳到某章，并定位到首个包含指定文字的段落 */
+  public async jumpToChapterText(chapterIndex: number, query: string): Promise<void> {
+    await this.loadChapter(chapterIndex, { page: 0 });
+    const lower = query.toLowerCase();
+    for (const el of this.cidEls) {
+      if (el.getText().toLowerCase().includes(lower)) {
+        if (this.viewportEl) {
+          const col = Math.floor(this.contentX(el) / this.stride());
+          this.viewportEl.scrollTo({ left: Math.max(0, col) * this.stride(), behavior: 'smooth' });
+        }
+        return;
+      }
+    }
+  }
+
+  public getBookmarks(): BookmarkItem[] {
+    if (!this.source) {
+      return [];
+    }
+    return this.plugin.data.bookmarks[this.sourceKey()] || [];
+  }
+
+  public async jumpToBookmark(item: BookmarkItem): Promise<void> {
+    await this.loadChapter(item.chapter, { cid: item.cid, percent: item.percent });
   }
 
   private showEmptyState(): void {
@@ -990,6 +1101,88 @@ function pickChapters(app: App, folder: TFolder, files: TFile[]): Promise<TFile[
 }
 
 /* ---------------- 选书与目录弹窗 ---------------- */
+
+/* ---------------- 搜索与书签弹窗 ---------------- */
+
+type BookSource2 = {
+  kind: 'bookmark';
+  item: BookmarkItem;
+};
+
+type SearchSource = {
+  kind: 'search';
+  chapter: number;
+  title: string;
+  snippet: string;
+  query: string;
+};
+
+type FindItem = BookSource2 | SearchSource;
+
+/**
+ * 输入为空时列出本书书签，有输入时对全书正文做子串匹配。
+ */
+class ReaderSearchModal extends FuzzySuggestModal<FindItem> {
+  private readonly view: NovelReaderView;
+  private readonly chapters: RenderChapter[];
+  private readonly texts: string[];
+
+  constructor(
+    app: App,
+    view: NovelReaderView,
+    chapters: RenderChapter[],
+    texts: string[]
+  ) {
+    super(app);
+    this.view = view;
+    this.chapters = chapters;
+    this.texts = texts;
+    this.setPlaceholder('搜索正文（留空查看书签）…');
+  }
+
+  public getItems(): FindItem[] {
+    const query = this.inputEl.value.trim();
+    if (query.length === 0) {
+      const marks = this.view.getBookmarks();
+      return marks.map((item) => ({ kind: 'bookmark', item }) as BookSource2);
+    }
+    const lower = query.toLowerCase();
+    const out: FindItem[] = [];
+    for (let i = 0; i < this.texts.length && out.length < 60; i++) {
+      const hay = this.texts[i].toLowerCase();
+      let pos = hay.indexOf(lower);
+      while (pos >= 0 && out.length < 60) {
+        const snippet = this.texts[i]
+          .slice(Math.max(0, pos - 8), pos + query.length + 24)
+          .replace(/\s+/g, ' ');
+        out.push({
+          kind: 'search',
+          chapter: i,
+          title: this.chapters[i].title,
+          snippet,
+          query,
+        });
+        pos = hay.indexOf(lower, pos + 1);
+      }
+    }
+    return out;
+  }
+
+  public getItemText(item: FindItem): string {
+    if (item.kind === 'bookmark') {
+      return `★ ${item.item.excerpt}`;
+    }
+    return `${item.title} ${item.snippet}`;
+  }
+
+  public onChooseItem(item: FindItem): void {
+    if (item.kind === 'bookmark') {
+      void this.view.jumpToBookmark(item.item);
+    } else {
+      void this.view.jumpToChapterText(item.chapter, item.query);
+    }
+  }
+}
 
 type PickItem =
   | { kind: 'file'; file: TFile }
