@@ -442,8 +442,11 @@ class NovelReaderPlugin extends obsidian_1.Plugin {
                 return matched;
             }
         }
-        const liked = all.filter((f) => chapterLike(f.name));
-        return liked.length > 0 ? liked : all;
+        // 没配置过就整文件夹都要（0 字节占位文件已在 listChapterFiles 里排除）。
+        // 这里绝不能按「文件名像不像章节」自动挑：命名不规范的书会被挑得只剩一两章，
+        // 已保存的章序号被 min() 截断，表现就是每次打开都回到开头、书看起来是空的。
+        // 想排除设定稿 / 世界观这类非章节文件：书籍详情 →「重新选择章节」。
+        return all;
     }
     /** 这本书有哪些章（只取标题，不读全文，大书也不卡） */
     chapterTitlesOf(key) {
