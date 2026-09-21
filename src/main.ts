@@ -77,17 +77,35 @@ export interface BookProgress {
   chapterTitle?: string;
   /** 书架展示用：这本书一共多少章 */
   chapterCount?: number;
+  /**
+   * 只有全书百分比、没有可信章节序号（比如把单文件书拆成文件夹后迁移过来的进度）。
+   * 打开时按 overall 换算成章节，换算完即清除。
+   */
+  overallOnly?: boolean;
 }
 
 /** 读到 95% 以上就算读完（overall 是按章节估算的，很难正好到 100） */
 export const FINISHED_PERCENT = 95;
 
-/** 书架上的附加信息：置顶与显示名，都不动文件本身 */
+/** 书架上的附加信息：置顶、显示名、隐藏，都不动文件本身 */
 export interface ShelfMeta {
   /** 显示名（别名）：文件名不好看时给书起个名字，只在书架里生效 */
   alias?: string;
   /** 置顶时间（epoch ms）；0 或缺失表示不置顶 */
   pin?: number;
+  /** 从书架隐藏（设定稿、误开的单章等），进度数据仍然保留 */
+  hidden?: boolean;
+}
+
+/** 进度迁移结果：UI 用它告诉用户定位到了哪、准不准 */
+export interface MigrateResult {
+  chapter: number;
+  /** number = 按章号命中，percent = 按百分比估算，unknown = 目标章数未知只记了百分比 */
+  how: 'number' | 'percent' | 'unknown';
+  /** 一起搬过去的书签条数 */
+  bookmarks: number;
+  /** 目标书一共有多少章 */
+  total: number;
 }
 
 export interface ShelfEntry {
@@ -161,6 +179,19 @@ const DEFAULTS: PluginData = {
   shelfMeta: {},
 };
 
+/** 没有进度记录时的空进度（迁移、展示兜底都用它） */
+function emptyProgress(): BookProgress {
+  return {
+    chapter: 0,
+    cid: 0,
+    percent: 0,
+    overall: 0,
+    updatedAt: 0,
+    chapterTitle: '',
+    chapterCount: 0,
+  };
+}
+
 /** 兼容旧版本（v0.3.0 及以前）的进度结构：缺 chapter 字段时兜底为第 0 章 */
 function normalizeProgress(raw: unknown): BookProgress | null {
   if (!raw || typeof raw !== 'object') {
@@ -178,6 +209,7 @@ function normalizeProgress(raw: unknown): BookProgress | null {
     updatedAt: typeof rec.updatedAt === 'number' && Number.isFinite(rec.updatedAt) ? rec.updatedAt : 0,
     chapterTitle: typeof rec.chapterTitle === 'string' ? rec.chapterTitle : '',
     chapterCount: Math.max(0, Math.floor(num(rec.chapterCount, 0))),
+    overallOnly: rec.overallOnly === true,
   };
 }
 
@@ -399,6 +431,20 @@ export default class NovelReaderPlugin extends Plugin {
     }
   }
 
+  /** 按路径打开一本书（书架条目、迁移后的目标书都用它） */
+  public async openBookByKey(key: string): Promise<void> {
+    const af = this.app.vault.getAbstractFileByPath(key);
+    if (af instanceof TFile) {
+      await this.openBook({ kind: 'file', file: af });
+      return;
+    }
+    if (af instanceof TFolder) {
+      await this.openBook({ kind: 'folder', folder: af });
+      return;
+    }
+    new Notice('这本书已不在库中');
+  }
+
   public async openReader(): Promise<void> {
     const view = await this.ensureReaderView();
     if (!view || view.hasSource) {
@@ -459,13 +505,17 @@ export default class NovelReaderPlugin extends Plugin {
     }
     const entries: ShelfEntry[] = [];
     for (const key of keys) {
+      const meta = this.data.shelfMeta[key] || {};
+      // 手动隐藏的条目（设定稿、误开的单章）不进书架，进度数据仍然保留
+      if (meta.hidden) {
+        continue;
+      }
       const progress = this.data.books[key];
       const starredAt = this.data.shelf[key] || 0;
       if (!starredAt && progress && progress.updatedAt === 0 && progress.overall === 0) {
         continue;
       }
       const af = this.app.vault.getAbstractFileByPath(key);
-      const meta = this.data.shelfMeta[key] || {};
       const overall = progress ? progress.overall : 0;
       const base = {
         key,
@@ -520,8 +570,11 @@ export default class NovelReaderPlugin extends Plugin {
     if (!next.pin) {
       delete next.pin;
     }
+    if (!next.hidden) {
+      delete next.hidden;
+    }
     // 全空就整条删掉，别在数据里留下 {} 这种垃圾
-    if (next.alias === undefined && next.pin === undefined) {
+    if (next.alias === undefined && next.pin === undefined && next.hidden === undefined) {
       delete this.data.shelfMeta[path];
     } else {
       this.data.shelfMeta[path] = next;
@@ -542,10 +595,111 @@ export default class NovelReaderPlugin extends Plugin {
     return on;
   }
 
+  /** 书架隐藏开关，返回操作后的状态（true = 已隐藏），进度数据不动 */
+  public toggleHidden(path: string): boolean {
+    const current = this.data.shelfMeta[path];
+    const on = !(current && current.hidden);
+    this.writeShelfMeta(path, { hidden: on });
+    return on;
+  }
+
   /** 重置某本书的阅读进度（收藏、书签都保留） */
   public resetBookProgress(path: string): void {
     delete this.data.books[path];
     this.saveSoon();
+  }
+
+  /**
+   * 文件夹书实际包含哪些章节文件：有配置按配置，没配置就自动挑像章节的
+   * （挑不出来就整文件夹都要）——不再一上来就弹框问。
+   */
+  public chapterFilesOf(folder: TFolder): TFile[] {
+    const all = listChapterFiles(folder);
+    if (all.length === 0) {
+      return [];
+    }
+    const cfg = this.data.bookConfig[folder.path];
+    if (cfg && cfg.files.length > 0) {
+      const wanted = new Set(cfg.files);
+      // 兼容旧配置：既支持相对路径，也支持纯文件名
+      const matched = all.filter((f) => wanted.has(relPath(folder, f)) || wanted.has(f.name));
+      if (matched.length > 0) {
+        return matched;
+      }
+    }
+    const liked = all.filter((f) => chapterLike(f.name));
+    return liked.length > 0 ? liked : all;
+  }
+
+  /** 这本书有哪些章（只取标题，不读全文，大书也不卡） */
+  public chapterTitlesOf(key: string): string[] {
+    const af = this.app.vault.getAbstractFileByPath(key);
+    if (af instanceof TFolder) {
+      return this.chapterFilesOf(af).map((f) => relativeLabel(af, f));
+    }
+    if (af instanceof TFile) {
+      const cache = this.app.metadataCache.getFileCache(af);
+      const headings = (cache && cache.headings) || [];
+      // 无标题的网文体要读全文才知道怎么切章，这里不读，交给打开时按百分比定位
+      return headings.map((h) => h.heading);
+    }
+    return [];
+  }
+
+  /**
+   * 把一本书搬到另一个条目上（单文件 ↔ 文件夹互迁）：进度、书签、收藏、置顶、显示名、排版一起搬，
+   * 源条目从书架撤下。章节定位优先按章号匹配，匹配不上按全书百分比估算。
+   */
+  public migrateBook(fromKey: string, toKey: string): MigrateResult {
+    const src = normalizeProgress(this.data.books[fromKey]) || emptyProgress();
+    const titles = this.chapterTitlesOf(toKey);
+    const plan = planMigrate(src, titles);
+    const moved: BookProgress = {
+      chapter: plan.chapter,
+      // 两种形态的段落划分不同，锚点对不上：章内只保留比例，交给打开后重新定位
+      cid: 0,
+      percent: plan.how === 'unknown' ? 0 : src.percent,
+      overall: src.overall,
+      updatedAt: src.updatedAt > 0 ? src.updatedAt : Date.now(),
+      chapterTitle: titles.length > 0 ? titles[plan.chapter] || '' : src.chapterTitle,
+      chapterCount: titles.length,
+      overallOnly: plan.how === 'unknown' ? true : undefined,
+    };
+    if (!moved.overallOnly) {
+      delete moved.overallOnly;
+    }
+    this.data.books[toKey] = moved;
+
+    const marks = this.data.bookmarks[fromKey] || [];
+    if (marks.length > 0) {
+      const fromCount = src.chapterCount || 0;
+      for (const mark of marks) {
+        mark.chapter = scaleIndex(mark.chapter, fromCount, titles.length);
+        mark.cid = 0;
+      }
+      this.data.bookmarks[toKey] = marks.concat(this.data.bookmarks[toKey] || []);
+      delete this.data.bookmarks[fromKey];
+    }
+
+    if (this.data.shelf[fromKey]) {
+      this.data.shelf[toKey] = this.data.shelf[toKey] || this.data.shelf[fromKey];
+      delete this.data.shelf[fromKey];
+    }
+    const meta = this.data.shelfMeta[fromKey];
+    if (meta) {
+      this.data.shelfMeta[toKey] = { ...(this.data.shelfMeta[toKey] || {}), ...meta };
+      delete this.data.shelfMeta[fromKey];
+    }
+    if (this.data.bookStyle[fromKey]) {
+      this.data.bookStyle[toKey] = this.data.bookStyle[toKey] || this.data.bookStyle[fromKey];
+      delete this.data.bookStyle[fromKey];
+    }
+    delete this.data.books[fromKey];
+    if (this.data.lastBook === fromKey) {
+      this.data.lastBook = toKey;
+    }
+    this.saveSoon();
+    return { chapter: plan.chapter, how: plan.how, bookmarks: marks.length, total: titles.length };
   }
 
   /** 收藏一本书：没读过也能上架 */
@@ -932,6 +1086,89 @@ function splitNovelChapters(
   return out;
 }
 
+/* ---------------- 书籍形态迁移（单文件 ↔ 文件夹） ---------------- */
+
+/** 中文数字（章号里常见的那几种写法）转阿拉伯数字，认不出来返回 -1 */
+function cnNumber(raw: string): number {
+  const digits: Record<string, number> = {
+    零: 0, 〇: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9,
+  };
+  const units: Array<[string, number]> = [
+    ['千', 1000],
+    ['百', 100],
+    ['十', 10],
+  ];
+  let total = 0;
+  let cur = 0;
+  let seen = false;
+  for (const ch of raw) {
+    const d = digits[ch];
+    if (d !== undefined) {
+      cur = d;
+      seen = true;
+      continue;
+    }
+    const unit = units.find((u) => u[0] === ch);
+    if (unit) {
+      total += (cur === 0 ? 1 : cur) * unit[1];
+      cur = 0;
+      seen = true;
+      continue;
+    }
+    return -1;
+  }
+  return seen ? total + cur : -1;
+}
+
+/** 「第 123 章」「Chapter 12」这类标题里的章号，取不到返回 -1 */
+function chapterNumber(title: string): number {
+  const cn = /第\s*([0-9０-９一二三四五六七八九十百千零〇两]+)\s*章/.exec(title);
+  if (cn) {
+    const raw = cn[1].replace(/[０-９]/g, (d) => String(d.charCodeAt(0) - 0xff10));
+    return /^[0-9]+$/.test(raw) ? parseInt(raw, 10) : cnNumber(raw);
+  }
+  const en = /(?:^|[^a-z])chap(?:ter)?[^0-9]{0,3}([0-9０-９]+)/i.exec(title);
+  if (en) {
+    return parseInt(en[1].replace(/[０-９]/g, (d) => String(d.charCodeAt(0) - 0xff10)), 10);
+  }
+  return -1;
+}
+
+/** 章序号按比例从旧形态映射到新形态 */
+function scaleIndex(index: number, fromCount: number, toCount: number): number {
+  if (toCount <= 0 || fromCount <= 0) {
+    return 0;
+  }
+  return Math.min(toCount - 1, Math.max(0, Math.round((index / fromCount) * toCount)));
+}
+
+/** 迁移时把旧进度换算成目标书的章序号 */
+function planMigrate(
+  src: BookProgress,
+  titles: string[]
+): { chapter: number; how: 'number' | 'percent' | 'unknown' } {
+  const n = titles.length;
+  if (n === 0) {
+    // 目标是无标题的单文件大书：切章要读全文才知道，这里只记百分比，打开时再定位
+    return { chapter: 0, how: 'unknown' };
+  }
+  const num = src.chapterTitle ? chapterNumber(src.chapterTitle) : -1;
+  if (num >= 0) {
+    const hit = titles.findIndex((t) => chapterNumber(t) === num);
+    if (hit >= 0) {
+      return { chapter: hit, how: 'number' };
+    }
+    // 「第 N 章 ≈ 第 N 项」只在目标本身也按章编号时才成立；
+    // 目标标题里一个章号都解析不出来（比如按卷拆的「卷42」），划分单位跟源不一样，只能按百分比
+    const numbered = titles.filter((t) => chapterNumber(t) >= 0).length;
+    if (numbered > 0 && num >= 1 && num <= n) {
+      return { chapter: num - 1, how: 'number' };
+    }
+  }
+  const idx = Math.min(n - 1, Math.max(0, Math.round((src.overall / 100) * n) - 1));
+  return { chapter: idx, how: 'percent' };
+}
+
 /* ---------------- 阅读视图 ---------------- */
 
 type BookSource =
@@ -1168,38 +1405,42 @@ export class NovelReaderView extends ItemView {
     this.ro.observe(this.viewportEl!);
 
     const progress = normalizeProgress(this.plugin.data.books[this.sourceKey()]);
-    const index = progress
+    let index = progress
       ? Math.min(this.chapters.length - 1, Math.max(0, progress.chapter))
       : 0;
-    const target: JumpTarget = progress
+    let target: JumpTarget = progress
       ? { cid: progress.cid, percent: progress.percent }
       : { page: 0 };
+    if (progress && progress.overallOnly && this.chapters.length > 0) {
+      // 迁移过来的进度只有全书百分比：章节列表建好后按百分比换算，换算完把标记清掉
+      index = Math.min(
+        this.chapters.length - 1,
+        Math.max(0, Math.round((progress.overall / 100) * this.chapters.length) - 1)
+      );
+      target = { page: 0 };
+      const stored = this.plugin.data.books[this.sourceKey()];
+      if (stored) {
+        stored.chapter = index;
+        stored.cid = 0;
+        stored.percent = 0;
+        stored.chapterCount = this.chapters.length;
+        stored.chapterTitle = this.chapters[index] ? this.chapters[index].title : '';
+        delete stored.overallOnly;
+        this.plugin.saveSoon();
+      }
+    }
     await this.loadChapter(index, target);
   }
 
-  /** 文件夹书：按已保存的章节配置过滤，首次打开弹勾选框 */
+  /** 文件夹书：按已保存的章节配置过滤；没配置过就自动挑，不再一上来就弹框 */
   private async resolveFolderChapters(folder: TFolder): Promise<TFile[]> {
     const all = listChapterFiles(folder);
     if (all.length === 0) {
       new Notice('该文件夹没有 Markdown 文件');
       return [];
     }
-    const cfg = this.plugin.data.bookConfig[folder.path];
-    if (cfg && cfg.files.length > 0) {
-      const wanted = new Set(cfg.files);
-      // 兼容旧配置：既支持相对路径，也支持纯文件名
-      const matched = all.filter((f) => wanted.has(relPath(folder, f)) || wanted.has(f.name));
-      if (matched.length > 0) {
-        return matched;
-      }
-    }
-    const picked = await pickChapters(this.app, folder, all);
-    if (picked.length === 0) {
-      return [];
-    }
-    this.plugin.data.bookConfig[folder.path] = { files: picked.map((f) => relPath(folder, f)) };
-    this.plugin.saveSoon();
-    return picked;
+    // 想手动改章节范围：书籍详情里的「重新选择章节」
+    return this.plugin.chapterFilesOf(folder);
   }
 
   /** 构建章节列表：文件夹=每文件一章；单文件=按标题切虚拟章，无标题则按字数切 */
@@ -2938,6 +3179,54 @@ class BookDetailModal extends Modal {
         }
       ).open();
     });
+    mk('迁移进度到…', '', () => {
+      new PickBookModal(plugin, entry.key, (target) => {
+        new ConfirmModal(
+          this.app,
+          '迁移进度',
+          `把《${entry.title}》的进度、书签、收藏与显示名迁到《${target}》？\n` +
+            `定位方式：优先按章号匹配，匹配不上按全书百分比估算；源条目会从书架撤下。`,
+          () => {
+            const r = plugin.migrateBook(entry.key, target);
+            const how =
+              r.how === 'number' ? '按章号命中' : r.how === 'percent' ? '按百分比估算' : '目标章数未知，打开时再定位';
+            new Notice(
+              `已迁移到《${target}》：第 ${r.chapter + 1} 章（${how}）` +
+                (r.bookmarks > 0 ? ` · 书签 ${r.bookmarks} 条` : '')
+            );
+            const view = plugin.getActiveReaderView();
+            if (view && view.hasSource && view.sourceKey() === entry.key) {
+              void plugin.openBookByKey(target);
+            }
+            this.onChanged();
+            this.close();
+          }
+        ).open();
+      }).open();
+    });
+    if (entry.kind === 'folder') {
+      mk('重新选择章节', '', async () => {
+        const folder = this.app.vault.getAbstractFileByPath(entry.key);
+        if (!(folder instanceof TFolder)) {
+          new Notice('这个文件夹已不在库中');
+          return;
+        }
+        const picked = await pickChapters(this.app, folder, listChapterFiles(folder));
+        if (picked.length === 0) {
+          new Notice('至少选一个章节');
+          return;
+        }
+        plugin.data.bookConfig[folder.path] = { files: picked.map((f) => relPath(folder, f)) };
+        plugin.saveSoon();
+        new Notice(`《${entry.title}》的章节已更新为 ${picked.length} 篇`);
+        const view = plugin.getActiveReaderView();
+        if (view && view.hasSource && view.sourceKey() === entry.key) {
+          await view.openSource({ kind: 'folder', folder });
+        }
+        this.onChanged();
+        this.close();
+      });
+    }
     mk(entry.starred ? '取消收藏' : '收藏', '', () => {
       const on = plugin.toggleShelf(entry.key);
       entry.starred = on;
@@ -2952,6 +3241,12 @@ class BookDetailModal extends Modal {
         this.onChanged();
         this.close();
       }).open();
+    });
+    mk('从书架隐藏', '', () => {
+      plugin.toggleHidden(entry.key);
+      new Notice(`《${entry.title}》已从书架隐藏，进度仍保留（设置里可恢复）`);
+      this.onChanged();
+      this.close();
     });
     mk('移除', 'nr-btn-danger', () => {
       new ConfirmModal(this.app, '从书架移除', `移除《${entry.title}》的全部记录？`, () => {
@@ -2974,6 +3269,94 @@ class BookDetailModal extends Modal {
           new Notice('当前版本不支持这个操作');
         }
       });
+    }
+  }
+}
+
+/** 选一本书：迁移进度时挑目标（单文件与文件夹都列，排除自己） */
+class PickBookModal extends FuzzySuggestModal<PickItem> {
+  private readonly plugin: NovelReaderPlugin;
+  private readonly exclude: string;
+  private readonly onPick: (path: string) => void;
+
+  constructor(plugin: NovelReaderPlugin, exclude: string, onPick: (path: string) => void) {
+    super(plugin.app);
+    this.plugin = plugin;
+    this.exclude = exclude;
+    this.onPick = onPick;
+    this.setPlaceholder('迁移到哪一本书？（书名 / 路径均可）…');
+  }
+
+  public getItems(): PickItem[] {
+    return collectLibrary(this.app, this.plugin.data.settings.deepBrowse).filter(
+      (item) => itemPath(item) !== this.exclude
+    );
+  }
+
+  public getItemText(item: PickItem): string {
+    const path = itemPath(item).replace(/\.md$/, '');
+    return item.kind === 'folder'
+      ? `${path} · 文件夹 · ${countMd(item.folder)} 篇`
+      : `${path} · 单文件`;
+  }
+
+  public onChooseItem(item: PickItem): void {
+    this.onPick(itemPath(item));
+  }
+}
+
+/** 设置里管理被隐藏的书：书架不显示，但进度还在，随时能恢复 */
+class HiddenBooksModal extends Modal {
+  private readonly plugin: NovelReaderPlugin;
+
+  constructor(plugin: NovelReaderPlugin) {
+    super(plugin.app);
+    this.plugin = plugin;
+  }
+
+  public onOpen(): void {
+    this.contentEl.addClass('nr-shelf');
+    this.titleEl.setText('已隐藏的书');
+    const keys = Object.keys(this.plugin.data.shelfMeta).filter(
+      (k) => this.plugin.data.shelfMeta[k] && this.plugin.data.shelfMeta[k].hidden
+    );
+    if (keys.length === 0) {
+      this.contentEl.createDiv({ cls: 'nr-shelf-hint', text: '没有隐藏的书' });
+      return;
+    }
+    this.contentEl.createDiv({
+      cls: 'nr-shelf-hint',
+      text: `共 ${keys.length} 本，恢复后会重新出现在书架里`,
+    });
+    const list = this.contentEl.createDiv({ cls: 'nr-shelf-list' });
+    for (const key of keys) {
+      const af = this.app.vault.getAbstractFileByPath(key);
+      const name = af instanceof TFolder ? af.name : af instanceof TFile ? af.basename : key;
+      const meta = this.plugin.data.shelfMeta[key] || {};
+      const row = list.createDiv({ cls: 'nr-shelf-item' });
+      const main = row.createDiv({ cls: 'nr-shelf-main' });
+      main.createDiv({ cls: 'nr-shelf-title', text: meta.alias || name });
+      const progress = this.plugin.data.books[key];
+      main.createDiv({
+        cls: 'nr-shelf-meta',
+        text: `${key}${progress ? ` · 已读 ${progress.overall}%` : ''}`,
+      });
+      const show = row.createEl('button', { cls: 'nr-btn', text: '恢复显示' });
+      show.onclick = () => {
+        this.plugin.toggleHidden(key);
+        new Notice(`《${meta.alias || name}》已恢复显示`);
+        this.plugin.refreshShelfViews();
+        this.close();
+      };
+      const del = row.createEl('button', { cls: 'nr-btn nr-btn-danger', text: '彻底移除' });
+      del.onclick = () => {
+        new ConfirmModal(this.app, '彻底移除', `移除《${name}》的阅读记录与书签？`, () => {
+          this.plugin.removeFromShelf(key);
+          new Notice(`已移除《${name}》`);
+          this.plugin.refreshShelfViews();
+          this.close();
+        }).open();
+      };
     }
   }
 }
@@ -3499,6 +3882,18 @@ class NovelReaderSettingTab extends PluginSettingTab {
             this.plugin.saveSoon();
             this.plugin.refreshShelfViews();
           });
+      });
+
+    const hiddenCount = Object.keys(this.plugin.data.shelfMeta).filter(
+      (k) => this.plugin.data.shelfMeta[k] && this.plugin.data.shelfMeta[k].hidden
+    ).length;
+    new Setting(containerEl)
+      .setName('已隐藏的书')
+      .setDesc(`书架里不显示 ${hiddenCount} 本（进度数据仍保留），可以在这里恢复或彻底移除`)
+      .addButton((btn) => {
+        btn.setButtonText('管理').onClick(() => {
+          new HiddenBooksModal(this.plugin).open();
+        });
       });
 
     new Setting(containerEl)
