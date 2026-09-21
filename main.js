@@ -183,12 +183,11 @@ class NovelReaderPlugin extends obsidian_1.Plugin {
             const af = this.app.vault.getAbstractFileByPath(key);
             const progress = this.data.books[key];
             if (af instanceof obsidian_1.TFolder) {
-                const count = af.children.filter((c) => c instanceof obsidian_1.TFile && c.extension === 'md').length;
                 entries.push({
                     key,
                     kind: 'folder',
                     title: af.name,
-                    detail: `文件夹 · ${count} 篇`,
+                    detail: `文件夹 · ${countMd(af)} 篇`,
                     overall: progress.overall,
                     updatedAt: progress.updatedAt,
                 });
@@ -215,6 +214,44 @@ class NovelReaderPlugin extends obsidian_1.Plugin {
             this.data.lastBook = null;
         }
         this.saveSoon();
+    }
+    /** 文件/文件夹改名后迁移进度、书签与章节配置，避免阅读记录丢失 */
+    remapBookRecord(oldPath, newPath) {
+        if (!oldPath || oldPath === newPath) {
+            return;
+        }
+        const d = this.data;
+        if (d.books[oldPath]) {
+            d.books[newPath] = d.books[oldPath];
+            delete d.books[oldPath];
+        }
+        if (d.bookmarks[oldPath]) {
+            d.bookmarks[newPath] = d.bookmarks[oldPath];
+            delete d.bookmarks[oldPath];
+        }
+        if (d.bookConfig[oldPath]) {
+            d.bookConfig[newPath] = d.bookConfig[oldPath];
+            delete d.bookConfig[oldPath];
+        }
+        if (d.lastBook === oldPath) {
+            d.lastBook = newPath;
+        }
+        this.saveSoon();
+    }
+    /** 文件夹书内部某个 md 改名后，同步更新已保存的章节配置 */
+    remapChapterPath(folderPath, oldPath, newPath) {
+        const cfg = this.data.bookConfig[folderPath];
+        if (!cfg) {
+            return;
+        }
+        const prefix = folderPath + '/';
+        const oldRel = oldPath.startsWith(prefix) ? oldPath.slice(prefix.length) : oldPath;
+        const newRel = newPath.startsWith(prefix) ? newPath.slice(prefix.length) : newPath;
+        const i = cfg.files.indexOf(oldRel);
+        if (i >= 0) {
+            cfg.files[i] = newRel;
+            this.saveSoon();
+        }
     }
     getActiveReaderView() {
         const leaves = this.app.workspace.getLeavesOfType(exports.NOVEL_READER_VIEW_TYPE);
@@ -267,6 +304,31 @@ function chapterLike(name) {
     }
     return /chapter/i.test(name);
 }
+/**
+ * metadataCache 的 offset 以完整文件为基准；cachedRead 返回的文本是否还带着
+ * frontmatter 在官方 API 里没写死。这里用第一个标题做一次探测，自动对齐基准，
+ * 避免有 frontmatter 的书整体串章。探测失败时退回 0（保持原有行为）。
+ */
+function resolveOffsetBase(text, headings, fmEnd) {
+    if (headings.length === 0) {
+        return 0;
+    }
+    const probe = headings[0].heading.trim();
+    if (!probe) {
+        return 0;
+    }
+    const raw = headings[0].position.start.offset;
+    for (const base of fmEnd > 0 ? [0, fmEnd] : [0]) {
+        const start = raw - base;
+        if (start < 0 || start >= text.length) {
+            continue;
+        }
+        if (text.slice(start, start + probe.length + 10).includes(probe)) {
+            return base;
+        }
+    }
+    return 0;
+}
 /** 无标题的长文本按段落边界切成若干虚拟章 */
 function splitByLength(text, size) {
     const out = [];
@@ -290,6 +352,8 @@ class NovelReaderView extends obsidian_1.ItemView {
     constructor(leaf, plugin) {
         super(leaf);
         this.source = null;
+        /** 打开时记录的书路径：TFile/TFolder 实例会被 Obsidian 就地改名，不能直接拿来比对旧路径 */
+        this.openPath = '';
         this.chapters = [];
         this.chapterIndex = 0;
         this.viewportEl = null;
@@ -301,6 +365,12 @@ class NovelReaderView extends obsidian_1.ItemView {
         this.pageCount = 1;
         this.ro = null;
         this.scrollRaf = 0;
+        /** 平滑翻页进行中的目标页，用于避免连点时读取中间 scrollLeft 造成丢页 */
+        this.pendingPage = 0;
+        /** 平滑翻页动画的预期结束时间（epoch ms） */
+        this.pendingExpire = 0;
+        /** 源文件被改动后的重渲染防抖 */
+        this.modifyTimer = null;
         this.touchX = 0;
         this.touchY = 0;
         this.touchT = 0;
@@ -330,7 +400,8 @@ class NovelReaderView extends obsidian_1.ItemView {
             if (!this.source) {
                 return;
             }
-            const gone = (this.source.kind === 'file' && this.source.file.path === file.path) ||
+            const gone = this.openPath === file.path ||
+                (this.source.kind === 'file' && this.source.file.path === file.path) ||
                 (this.source.kind === 'folder' && this.source.folder.path === file.path) ||
                 this.chapters.some((c) => c.file.path === file.path);
             if (gone) {
@@ -341,34 +412,58 @@ class NovelReaderView extends obsidian_1.ItemView {
             if (!this.source) {
                 return;
             }
-            if (this.source.kind === 'file' && this.source.file.path === oldPath) {
-                if (file instanceof obsidian_1.TFile) {
-                    this.source = { kind: 'file', file };
-                    this.chapters.forEach((c) => {
-                        if (c.file.path === oldPath) {
-                            c.file = file;
-                        }
-                    });
-                }
-                else {
-                    this.showEmptyState();
-                }
+            // 章节 md 改名：同步文件夹书已保存的章节配置
+            if (this.source.kind === 'folder') {
+                this.plugin.remapChapterPath(this.source.folder.path, oldPath, file.path);
+            }
+            if (oldPath !== this.openPath) {
                 return;
             }
-            if (this.source.kind === 'folder' && this.source.folder.path === oldPath) {
-                if (file instanceof obsidian_1.TFolder) {
-                    this.source = { kind: 'folder', folder: file };
-                }
-                else {
-                    this.showEmptyState();
-                }
+            this.openPath = file.path;
+            if (this.source.kind === 'file' && file instanceof obsidian_1.TFile) {
+                this.source = { kind: 'file', file };
             }
+            else if (this.source.kind === 'folder' && file instanceof obsidian_1.TFolder) {
+                this.source = { kind: 'folder', folder: file };
+            }
+            else {
+                this.showEmptyState();
+                return;
+            }
+            // 迁移这本书的进度 / 书签 / 配置，否则改名等于丢进度
+            this.plugin.remapBookRecord(oldPath, file.path);
+            this.plugin.saveSoon();
+        }));
+        // 正在读的文件被改动（同端编辑或同步拉回）：防抖后重渲染，保持阅读位置
+        this.registerEvent(this.app.vault.on('modify', (file) => {
+            if (!this.source || !(file instanceof obsidian_1.TFile)) {
+                return;
+            }
+            const current = this.chapters[this.chapterIndex];
+            if (!current || current.file.path !== file.path) {
+                return;
+            }
+            if (this.modifyTimer !== null) {
+                window.clearTimeout(this.modifyTimer);
+            }
+            this.modifyTimer = window.setTimeout(() => {
+                this.modifyTimer = null;
+                const src = this.source;
+                if (!src) {
+                    return;
+                }
+                void this.openSource(src);
+            }, 1200);
         }));
         this.showEmptyState();
     }
     async onClose() {
         this.saveProgressNow();
         document.body.removeClass('nr-immersive');
+        this.disposePaging();
+    }
+    /** 释放分页相关资源（ResizeObserver / 待处理 rAF / 防抖定时器） */
+    disposePaging() {
         if (this.ro) {
             this.ro.disconnect();
             this.ro = null;
@@ -381,17 +476,32 @@ class NovelReaderView extends obsidian_1.ItemView {
             window.cancelAnimationFrame(this.pinchRaf);
             this.pinchRaf = 0;
         }
+        if (this.modifyTimer !== null) {
+            window.clearTimeout(this.modifyTimer);
+            this.modifyTimer = null;
+        }
+        this.pendingPage = 0;
+        this.pendingExpire = 0;
     }
     async openSource(src) {
+        // 换书前先释放上一本书的资源：旧 ResizeObserver 会强引用整棵旧 DOM 树
+        this.disposePaging();
         this.source = src;
-        this.plugin.data.lastBook = this.sourceKey();
-        this.plugin.saveSoon();
         const files = src.kind === 'file' ? [src.file] : await this.resolveFolderChapters(src.folder);
         if (files.length === 0) {
             this.showEmptyState();
             return;
         }
         this.chapters = await this.buildChapters(files);
+        if (this.chapters.length === 0) {
+            new obsidian_1.Notice('这本书还没有可读内容');
+            this.showEmptyState();
+            return;
+        }
+        // 确认能打开后才记录 lastBook，避免把不可用的路径写进数据
+        this.openPath = this.sourceKey();
+        this.plugin.data.lastBook = this.openPath;
+        this.plugin.saveSoon();
         this.contentEl.empty();
         this.contentEl.addClass('novel-reader');
         this.buildShell();
@@ -439,6 +549,9 @@ class NovelReaderView extends obsidian_1.ItemView {
         const chapters = [];
         if (this.source && this.source.kind === 'folder') {
             for (const file of files) {
+                if (isEmptyFile(file)) {
+                    continue;
+                }
                 chapters.push({
                     file,
                     title: relativeLabel(this.source.folder, file),
@@ -451,10 +564,18 @@ class NovelReaderView extends obsidian_1.ItemView {
         const text = await this.app.vault.cachedRead(file);
         const cache = this.app.metadataCache.getFileCache(file);
         const headings = (cache && cache.headings) || [];
-        if (headings.length >= 2) {
+        const fmEnd = cache && cache.frontmatterPosition ? cache.frontmatterPosition.end.offset : 0;
+        const base = resolveOffsetBase(text, headings, fmEnd);
+        if (headings.length >= 1) {
+            const first = Math.max(0, headings[0].position.start.offset - base);
+            // 标题之前若有前言/卷首内容，单独成章；否则只 1 个标题的书会退化成按字数乱切
+            if (first > 0 && text.slice(0, first).trim().length > 0) {
+                chapters.push({ file, title: file.basename, level: 1, start: 0, end: first });
+            }
             for (let i = 0; i < headings.length; i++) {
-                const start = headings[i].position.start.offset;
-                const end = i + 1 < headings.length ? headings[i + 1].position.start.offset : text.length;
+                const nextOff = i + 1 < headings.length ? headings[i + 1].position.start.offset : -1;
+                const start = Math.max(0, headings[i].position.start.offset - base);
+                const end = i + 1 < headings.length ? Math.max(start, nextOff - base) : text.length;
                 chapters.push({ file, title: headings[i].heading, level: headings[i].level, start, end });
             }
             return chapters;
@@ -520,6 +641,11 @@ class NovelReaderView extends obsidian_1.ItemView {
                 const next = Math.min(FONT_MAX, Math.max(FONT_MIN, Math.round((this.pinchFont * dist) / this.pinchDist)));
                 this.suppressClick = true;
                 this.applyFontSizeLive(next);
+                return;
+            }
+            // 单指拖动：禁掉原生横向滚动，否则页面会停在两列之间的错位位置
+            if (this.touchT > 0) {
+                evt.preventDefault();
             }
         }, { passive: false });
         this.registerDomEvent(overlay, 'touchend', (evt) => {
@@ -706,6 +832,9 @@ class NovelReaderView extends obsidian_1.ItemView {
         if (!this.viewportEl || !this.pageEl) {
             return;
         }
+        // 章节或布局变了，旧的动画目标失效
+        this.pendingExpire = 0;
+        this.pendingPage = 0;
         this.pageEl.style.columnWidth = `${this.viewportEl.clientWidth}px`;
         this.pageCount = Math.max(1, Math.ceil(this.pageEl.scrollWidth / this.stride()));
         if (target) {
@@ -773,12 +902,20 @@ class NovelReaderView extends obsidian_1.ItemView {
         }
         return Math.max(0, Math.round(this.viewportEl.scrollLeft / this.stride()));
     }
+    /** 翻页基准：平滑动画进行中直接用目标页，避免读到动画中间的 scrollLeft 造成连点丢页 */
+    basePage() {
+        if (this.pendingExpire && Date.now() < this.pendingExpire) {
+            return this.pendingPage;
+        }
+        this.pendingExpire = 0;
+        return this.currentPageIndex();
+    }
     turnPage(dir) {
         if (!this.viewportEl) {
             return;
         }
         this.toggleSheet(false);
-        const target = this.currentPageIndex() + dir;
+        const target = this.basePage() + dir;
         if (target < 0) {
             if (this.chapterIndex > 0) {
                 void this.loadChapter(this.chapterIndex - 1, { last: true });
@@ -791,6 +928,8 @@ class NovelReaderView extends obsidian_1.ItemView {
             }
             return;
         }
+        this.pendingPage = target;
+        this.pendingExpire = Date.now() + 450;
         this.viewportEl.scrollTo({ left: target * this.stride(), behavior: 'smooth' });
     }
     currentAnchor() {
@@ -881,7 +1020,8 @@ class NovelReaderView extends obsidian_1.ItemView {
         else {
             const anchorEl = this.cidEls[anchor.cid];
             const raw = anchorEl ? anchorEl.getText() : '';
-            const excerpt = raw.replace(/\s+/g, ' ').slice(0, 24) || this.chapters[anchor.chapter].title;
+            const chapter = this.chapters[anchor.chapter];
+            const excerpt = raw.replace(/\s+/g, ' ').slice(0, 24) || (chapter ? chapter.title : this.bookTitle());
             list.push({ chapter: anchor.chapter, cid: anchor.cid, percent: anchor.percent, excerpt });
             new obsidian_1.Notice(`已添加书签：${excerpt}`);
         }
@@ -926,15 +1066,19 @@ class NovelReaderView extends obsidian_1.ItemView {
     }
     showEmptyState() {
         this.source = null;
+        this.openPath = '';
         this.chapters = [];
         this.chapterIndex = 0;
         this.cidEls = [];
         this.pageCount = 1;
+        this.disposePaging();
+        // DOM 已被清空，清掉这些引用，避免后续操作到游离节点上
+        this.viewportEl = null;
+        this.pageEl = null;
+        this.statusEl = null;
+        this.sheetEl = null;
+        this.themeBtnEl = null;
         document.body.removeClass('nr-immersive');
-        if (this.ro) {
-            this.ro.disconnect();
-            this.ro = null;
-        }
         this.contentEl.empty();
         this.contentEl.addClass('novel-reader');
         const empty = this.contentEl.createDiv({ cls: 'novel-reader-empty' });
@@ -960,13 +1104,15 @@ function comparePaths(a, b) {
     }
     return as.length - bs.length;
 }
-/** 递归收集文件夹下的所有 Markdown（含子文件夹），按路径排序 */
+/** 递归收集文件夹下的所有 Markdown（含子文件夹），跳过空占位文件，按路径排序 */
 function listChapterFiles(folder) {
     const found = [];
     const walk = (current) => {
         for (const child of current.children) {
             if (child instanceof obsidian_1.TFile && child.extension === 'md') {
-                found.push(child);
+                if (!isEmptyFile(child)) {
+                    found.push(child);
+                }
             }
             else if (child instanceof obsidian_1.TFolder) {
                 walk(child);
@@ -975,6 +1121,11 @@ function listChapterFiles(folder) {
     };
     walk(folder);
     return found.sort((a, b) => comparePaths(a.path, b.path));
+}
+/** 0 字节或近乎空的占位 md：渲染出来只有一张白页 */
+function isEmptyFile(file) {
+    const size = file && file.stat ? file.stat.size : 0;
+    return size <= 4;
 }
 /** 章节相对书根的路径标签，如 `左道/术法` */
 function relativeLabel(root, file) {
@@ -1201,7 +1352,9 @@ function countMd(folder) {
     let n = 0;
     for (const child of folder.children) {
         if (child instanceof obsidian_1.TFile && child.extension === 'md') {
-            n += 1;
+            if (!isEmptyFile(child)) {
+                n += 1;
+            }
         }
         else if (child instanceof obsidian_1.TFolder) {
             n += countMd(child);
