@@ -59,6 +59,14 @@
   font-weight: 500;
 }
 
+/* 图片/嵌入内容不得超过列宽，否则会把整列撑开、分页错位 */
+.nr-page img,
+.nr-page video,
+.nr-page .internal-embed {
+  max-width: 100%;
+  height: auto;
+}
+
 /* ---------- 点击分区覆盖层 ---------- */
 .nr-overlay {
   position: absolute;
@@ -176,8 +184,17 @@
   display: flex;
   flex-direction: column;
   gap: 2px;
+}
+.nr-toc-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
   max-height: 60vh;
   overflow-y: auto;
+}
+.nr-toc-more {
+  align-self: center;
+  margin-top: 8px;
 }
 .nr-toc-item {
   text-align: left;

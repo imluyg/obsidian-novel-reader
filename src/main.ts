@@ -25,6 +25,12 @@ import {
 export const NOVEL_READER_VIEW_TYPE = 'novel-reader-view';
 /** 单文件大书无标题时，按此字数切虚拟章（在段落边界断开） */
 const CHUNK_SIZE = 8000;
+/** 单章字数上限：再长就在段落边界补切一刀，避免一章的 DOM 太大拖慢排版 */
+const CHAPTER_MAX_CHARS = 24000;
+/** 短于这个长度的"章"视为连续标题行（「第一卷」「第一章」紧挨着），合并掉 */
+const MIN_CHAPTER_CHARS = 300;
+/** 目录弹窗一次渲染多少条，超出的点「显示更多」追加（大书可能有上千章） */
+const TOC_PAGE = 300;
 
 const GAP = 48;
 const FONT_MIN = 12;
@@ -170,6 +176,38 @@ export default class NovelReaderPlugin extends Plugin {
     this.registerView(NOVEL_READER_VIEW_TYPE, (leaf: WorkspaceLeaf) => {
       return new NovelReaderView(leaf, this);
     });
+
+    // 阅读器没打开时也要维护书籍数据：在文件树里改名/删掉一本书不该让进度凭空消失
+    // （视图打开着的情形由视图自己处理，这里跳过，避免重复迁移）
+    this.registerEvent(
+      this.app.vault.on('rename', (file, oldPath) => {
+        if (this.readerViews().some((v) => v.handlesPath(oldPath))) {
+          return;
+        }
+        this.remapBookRecord(oldPath, file.path);
+        const parent = file.parent;
+        if (parent && this.data.bookConfig[parent.path]) {
+          this.remapChapterPath(parent.path, oldPath, file.path);
+        }
+        this.saveSoon();
+      })
+    );
+    this.registerEvent(
+      this.app.vault.on('delete', (file) => {
+        const path = file.path;
+        if (this.readerViews().some((v) => v.handlesPath(path))) {
+          return;
+        }
+        if (
+          this.data.books[path] ||
+          this.data.bookmarks[path] ||
+          this.data.bookConfig[path] ||
+          this.data.bookStyle[path]
+        ) {
+          this.removeFromShelf(path);
+        }
+      })
+    );
 
     this.addSettingTab(new NovelReaderSettingTab(this.app, this));
 
@@ -410,11 +448,20 @@ export default class NovelReaderPlugin extends Plugin {
 
   /** 让已打开的阅读器按当前设置重排 */
   public refreshReaderViews(): void {
+    for (const view of this.readerViews()) {
+      view.refreshTypography();
+    }
+  }
+
+  /** 所有已打开的阅读器视图 */
+  private readerViews(): NovelReaderView[] {
+    const out: NovelReaderView[] = [];
     for (const leaf of this.app.workspace.getLeavesOfType(NOVEL_READER_VIEW_TYPE)) {
       if (leaf.view instanceof NovelReaderView) {
-        leaf.view.refreshTypography();
+        out.push(leaf.view);
       }
     }
+    return out;
   }
 
   public getActiveReaderView(): NovelReaderView | null {
@@ -520,6 +567,108 @@ function splitByLength(
   return out;
 }
 
+/**
+ * 网文爬站体小说：整篇每行都缩进（4 空格或全角空格），且一个 markdown 标题都没有。
+ * 行首缩进必须去掉——markdown 里 4 空格缩进 = 代码块，几百万字会被渲染成一个不换行的
+ * <pre>，横向撑爆 multi-column，分页和滚动全乱。同时顺手统一换行、压掉连续空行。
+ * 注意：只在没有 metadataCache headings 时才用，否则会破坏 heading offset。
+ */
+function normalizePlainNovel(raw: string): string {
+  return raw
+    .replace(/\r\n?/g, '\n')
+    .replace(/^[ \t\u3000]+/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+/** 「第一章」「第 12 节」「Chapter 3」「Vol.2」这类纯文本章节行 */
+const CHAPTER_LINE_SOURCE =
+  '(?:^|\\n)([ \\t\\u3000]*)(第[0-9零一二三四五六七八九十百千万两]{1,12}[章节節回卷篇集部]|chapter\\s*\\d+|vol\\.?\\s*\\d+)';
+
+function isChapterLine(line: string): boolean {
+  return (
+    /^第[0-9零一二三四五六七八九十百千万两]{1,12}[章节節回卷篇集部]/.test(line) ||
+    /^(chapter\s*\d+|vol\.?\s*\d+)/i.test(line)
+  );
+}
+
+/**
+ * 按「第 N 章」这类纯文本标题行切章（大书靠这个保住章节结构，而不是按字数乱切）。
+ * 切出来过长的章再按段落边界细分；识别不到（少于 2 处）返回空数组，由调用方退回按字数切。
+ */
+function splitNovelChapters(
+  text: string,
+  basename: string,
+  maxChars: number
+): Array<{ title: string; start: number; end: number }> {
+  const marks: Array<{ offset: number; title: string }> = [];
+  const re = new RegExp(CHAPTER_LINE_SOURCE, 'gi');
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    // m[1] = 行首缩进，m[2] = 匹配到的章节关键词
+    const offset = m.index + m[0].length - m[1].length - m[2].length;
+    let nl = text.indexOf('\n', offset);
+    if (nl < 0) {
+      nl = text.length;
+    }
+    const title = text.slice(offset, Math.min(nl, offset + 40)).trim();
+    marks.push({ offset, title: title || m[2] });
+    if (marks.length >= 20000) {
+      break;
+    }
+  }
+  // 「第一卷」「第一章」这类紧挨着的连续标题行（还有缩进重复一次的同名行）
+  // 会切出只有几个字的空章，这里按最小长度合并，后一条更具体就替换掉前一条
+  const kept: Array<{ offset: number; title: string }> = [];
+  for (const mark of marks) {
+    const prev = kept[kept.length - 1];
+    if (prev && mark.offset - prev.offset < MIN_CHAPTER_CHARS) {
+      kept[kept.length - 1] = mark;
+      continue;
+    }
+    kept.push(mark);
+  }
+  if (kept.length < 2) {
+    return [];
+  }
+
+  const out: Array<{ title: string; start: number; end: number }> = [];
+  const pushRange = (start: number, end: number, title: string): void => {
+    if (end <= start) {
+      return;
+    }
+    if (end - start <= maxChars) {
+      out.push({ title, start, end });
+      return;
+    }
+    let s = start;
+    let part = 1;
+    while (end - s > maxChars) {
+      const tail = text.slice(s, s + maxChars);
+      const cut = Math.max(tail.lastIndexOf('\n\n'), tail.lastIndexOf('\n'));
+      const e = cut > maxChars * 0.4 ? s + cut + 1 : s + maxChars;
+      out.push({ title: `${title} · ${part}`, start: s, end: e });
+      s = e;
+      part += 1;
+    }
+    out.push({ title: `${title} · ${part}`, start: s, end });
+  };
+
+  if (kept[0].offset > 0) {
+    if (kept[0].offset < MIN_CHAPTER_CHARS) {
+      // 开篇太短（书名/作者/卷名几行），并进第一章，别单独占一个空章
+      kept[0] = { offset: 0, title: kept[0].title };
+    } else {
+      pushRange(0, kept[0].offset, `${basename} · 开篇`);
+    }
+  }
+  for (let i = 0; i < kept.length; i++) {
+    const end = i + 1 < kept.length ? kept[i + 1].offset : text.length;
+    pushRange(kept[i].offset, end, kept[i].title);
+  }
+  return out;
+}
+
 /* ---------------- 阅读视图 ---------------- */
 
 type BookSource =
@@ -566,6 +715,10 @@ export class NovelReaderView extends ItemView {
   private pinchFont = 0;
   private suppressClick = false;
   private pinchRaf = 0;
+  /** 单文件大书的整本正文缓存：切章只记偏移量，翻章时按需 slice，避免反复读/复制全文 */
+  private bookText: string | null = null;
+  /** 纯文本小说（网文爬站体）：不走 MarkdownRenderer，直接按行生成段落 */
+  private plainText = false;
 
   constructor(leaf: WorkspaceLeaf, plugin: NovelReaderPlugin) {
     super(leaf);
@@ -574,6 +727,11 @@ export class NovelReaderView extends ItemView {
 
   public get hasSource(): boolean {
     return this.source !== null;
+  }
+
+  /** 这本书是否正由本视图打开（插件级 vault 事件用它避免重复处理） */
+  public handlesPath(path: string): boolean {
+    return this.openPath === path;
   }
 
   public getViewType(): string {
@@ -597,13 +755,19 @@ export class NovelReaderView extends ItemView {
         if (!this.source) {
           return;
         }
-        const gone =
-          this.openPath === file.path ||
-          (this.source.kind === 'file' && this.source.file.path === file.path) ||
-          (this.source.kind === 'folder' && this.source.folder.path === file.path) ||
-          this.chapters.some((c) => c.file.path === file.path);
-        if (gone) {
+        if (this.openPath === file.path) {
           this.showEmptyState();
+          return;
+        }
+        if (this.source.kind === 'file') {
+          if (this.source.file.path === file.path) {
+            this.showEmptyState();
+          }
+          return;
+        }
+        // 文件夹书里少了一个章节文件：重新载入，不整本关掉
+        if (this.chapters.some((c) => c.file.path === file.path)) {
+          void this.openSource(this.source);
         }
       })
     );
@@ -656,6 +820,23 @@ export class NovelReaderView extends ItemView {
         }, 1200);
       })
     );
+    // 键盘翻页：注册在常驻容器上，只注册一次
+    // （放进 buildShell 会随每次换书重复注册，导致一次按键翻好几页）
+    this.containerEl.tabIndex = 0;
+    this.registerDomEvent(this.containerEl, 'keydown', (evt: KeyboardEvent) => {
+      const active = document.activeElement;
+      const tag = active ? active.tagName : '';
+      if (tag === 'INPUT' || tag === 'TEXTAREA') {
+        return;
+      }
+      if (evt.key === 'ArrowRight' || evt.key === 'PageDown' || evt.key === ' ') {
+        evt.preventDefault();
+        this.turnPage(1);
+      } else if (evt.key === 'ArrowLeft' || evt.key === 'PageUp') {
+        evt.preventDefault();
+        this.turnPage(-1);
+      }
+    });
     this.showEmptyState();
   }
 
@@ -775,23 +956,38 @@ export class NovelReaderView extends ItemView {
       return chapters;
     }
     const file = files[0];
-    const text = await this.app.vault.cachedRead(file);
+    const raw = await this.app.vault.cachedRead(file);
     const cache = this.app.metadataCache.getFileCache(file);
     const headings = (cache && cache.headings) || [];
-    const fmEnd = cache && cache.frontmatterPosition ? cache.frontmatterPosition.end.offset : 0;
-    const base = resolveOffsetBase(text, headings, fmEnd);
     if (headings.length >= 1) {
+      // markdown 书：章节边界来自 metadataCache，一个字符都不能预处理，否则 offset 全错
+      this.bookText = null;
+      this.plainText = false;
+      const fmEnd = cache && cache.frontmatterPosition ? cache.frontmatterPosition.end.offset : 0;
+      const base = resolveOffsetBase(raw, headings, fmEnd);
       const first = Math.max(0, headings[0].position.start.offset - base);
       // 标题之前若有前言/卷首内容，单独成章；否则只 1 个标题的书会退化成按字数乱切
-      if (first > 0 && text.slice(0, first).trim().length > 0) {
+      if (first > 0 && raw.slice(0, first).trim().length > 0) {
         chapters.push({ file, title: file.basename, level: 1, start: 0, end: first });
       }
       for (let i = 0; i < headings.length; i++) {
         const nextOff = i + 1 < headings.length ? headings[i + 1].position.start.offset : -1;
         const start = Math.max(0, headings[i].position.start.offset - base);
-        const end =
-          i + 1 < headings.length ? Math.max(start, nextOff - base) : text.length;
+        const end = i + 1 < headings.length ? Math.max(start, nextOff - base) : raw.length;
         chapters.push({ file, title: headings[i].heading, level: headings[i].level, start, end });
+      }
+      return chapters;
+    }
+
+    // 没有 markdown 标题 → 当成网文爬站体纯文本：先规范化（关键是去掉行首缩进），
+    // 再按「第 N 章」切章；切不出来才退回按字数切。
+    const text = normalizePlainNovel(raw);
+    this.bookText = text;
+    this.plainText = true;
+    const cuts = splitNovelChapters(text, file.basename, CHAPTER_MAX_CHARS);
+    if (cuts.length > 0) {
+      for (const c of cuts) {
+        chapters.push({ file, title: c.title, level: 1, start: c.start, end: c.end });
       }
       return chapters;
     }
@@ -846,13 +1042,18 @@ export class NovelReaderView extends ItemView {
       overlay,
       'touchstart',
       (evt: TouchEvent) => {
+        // 触摸序列开始：清掉上一轮可能残留的点击抑制标志（捏合不产生 click，会把它留到下一次点击）
+        this.suppressClick = false;
         if (evt.touches.length === 1) {
           this.touchX = evt.touches[0].clientX;
           this.touchY = evt.touches[0].clientY;
           this.touchT = Date.now();
         } else if (evt.touches.length === 2) {
           this.pinchDist = touchDistance(evt.touches[0], evt.touches[1]);
-          this.pinchFont = this.plugin.data.settings.fontSize;
+          // 捏合的基准字号要用这本书当前生效的（开了「每本书独立排版」时和全局默认值不同）
+          this.pinchFont = this.currentTypography().fontSize;
+          // 取消单指滑动状态：否则捏合结束抬起第一根手指时会被判成横滑翻页
+          this.touchT = 0;
         }
       },
       { passive: true }
@@ -883,7 +1084,8 @@ export class NovelReaderView extends ItemView {
       overlay,
       'touchend',
       (evt: TouchEvent) => {
-        if (evt.touches.length === 0 && this.pinchDist > 0) {
+        // 捏合结束：任意一根手指抬起就算结束（等 touches 归零会让剩下那根手指继续干扰）
+        if (this.pinchDist > 0 && evt.touches.length < 2) {
           this.pinchDist = 0;
           this.plugin.saveSoon();
           return;
@@ -914,17 +1116,6 @@ export class NovelReaderView extends ItemView {
       },
       { passive: false }
     );
-    this.containerEl.tabIndex = 0;
-    this.registerDomEvent(this.containerEl, 'keydown', (evt: KeyboardEvent) => {
-      if (evt.key === 'ArrowRight' || evt.key === 'PageDown' || evt.key === ' ') {
-        evt.preventDefault();
-        this.turnPage(1);
-      } else if (evt.key === 'ArrowLeft' || evt.key === 'PageUp') {
-        evt.preventDefault();
-        this.turnPage(-1);
-      }
-    });
-
     this.statusEl = this.contentEl.createDiv({ cls: 'nr-status' });
     this.buildSheet();
     this.registerDomEvent(this.viewportEl, 'scroll', () => {
@@ -1023,7 +1214,8 @@ export class NovelReaderView extends ItemView {
     this.setTypography({
       fontSize: Math.min(FONT_MAX, Math.max(FONT_MIN, t.fontSize + delta)),
     });
-    this.reflow();
+    // 必须走 refreshTypography：只写数据不刷 --nr-font 的话界面上字号不会变
+    this.refreshTypography();
   }
 
   private changeLineHeight(delta: number): void {
@@ -1031,7 +1223,7 @@ export class NovelReaderView extends ItemView {
     this.setTypography({
       lineHeight: Math.min(LH_MAX, Math.max(LH_MIN, Math.round((t.lineHeight + delta) * 10) / 10)),
     });
-    this.reflow();
+    this.refreshTypography();
   }
 
   /** 捏合过程中实时应用字号（rAF 节流重排，抬手时才落盘） */
@@ -1112,14 +1304,15 @@ export class NovelReaderView extends ItemView {
     this.chapterIndex = Math.min(this.chapters.length - 1, Math.max(0, index));
     const chapter = this.chapters[this.chapterIndex];
 
-    let md = await this.app.vault.cachedRead(chapter.file);
-    if (chapter.start !== undefined && chapter.end !== undefined) {
-      md = md.slice(chapter.start, chapter.end);
-    }
+    const md = await this.chapterText(chapter);
 
     this.pageEl.empty();
     const holder = this.pageEl.createDiv({ cls: 'nr-chapter' });
-    await MarkdownRenderer.render(this.app, md, holder, chapter.file.path, this);
+    if (this.plainText) {
+      this.renderPlainText(holder, md);
+    } else {
+      await MarkdownRenderer.render(this.app, md, holder, chapter.file.path, this);
+    }
 
     this.cidEls = [];
     let cid = 0;
@@ -1130,6 +1323,25 @@ export class NovelReaderView extends ItemView {
 
     this.relayout(undefined, target);
     this.saveProgressNow();
+  }
+
+  /**
+   * 纯文本小说：逐行生成 <p>，标题行单独成 <h3>。
+   * 比 MarkdownRenderer 快得多，也彻底避开「整篇缩进被当成代码块」的坑。
+   */
+  private renderPlainText(holder: HTMLElement, text: string): void {
+    const lines = text.split('\n');
+    for (const raw of lines) {
+      const line = raw.trim();
+      if (!line) {
+        continue;
+      }
+      if (isChapterLine(line)) {
+        holder.createEl('h3', { text: line.slice(0, 40) });
+      } else {
+        holder.createEl('p', { text: line });
+      }
+    }
   }
 
   private reflow(): void {
@@ -1326,8 +1538,11 @@ export class NovelReaderView extends ItemView {
     new BookshelfModal(this.plugin, this).open();
   }
 
-  /** 取出某一章的 Markdown 正文（虚拟章按偏移量切片） */
+  /** 取出某一章的正文：有整本缓存就按偏移量切片，否则读文件再切 */
   private async chapterText(chapter: RenderChapter): Promise<string> {
+    if (this.bookText !== null && chapter.start !== undefined && chapter.end !== undefined) {
+      return this.bookText.slice(chapter.start, chapter.end);
+    }
     const text = await this.app.vault.cachedRead(chapter.file);
     if (chapter.start !== undefined && chapter.end !== undefined) {
       return text.slice(chapter.start, chapter.end);
@@ -1379,7 +1594,12 @@ export class NovelReaderView extends ItemView {
       if (this.chaptersVersion !== version) {
         return;
       }
-      this.chapterTexts[i] = await this.chapterText(this.chapters[i]);
+      try {
+        this.chapterTexts[i] = await this.chapterText(this.chapters[i]);
+      } catch {
+        // 章节文件可能在索引构建过程中被删掉，跳过即可
+        this.chapterTexts[i] = '';
+      }
     }
   }
 
@@ -1389,8 +1609,60 @@ export class NovelReaderView extends ItemView {
       return;
     }
     this.toggleSheet(false);
-    this.ensureIndex();
+    // 单文件大书直接用内存里的整本缓存做全文匹配，不必给每一章再复制一份文本
+    if (this.bookText === null) {
+      this.ensureIndex();
+    }
     new ReaderSearchModal(this.app, this, this.chapters, this.chapterTexts).open();
+  }
+
+  /**
+   * 单文件大书的全文搜索：一次 indexOf 扫到底，按命中偏移反查章节。
+   * 有整本缓存时才返回数组，否则返回 null（交给逐章索引那条路）。
+   */
+  public searchFullText(query: string, limit: number): FindItem[] | null {
+    if (this.bookText === null || query.length === 0) {
+      return null;
+    }
+    const out: FindItem[] = [];
+    let from = 0;
+    while (out.length < limit) {
+      const at = this.bookText.indexOf(query, from);
+      if (at < 0) {
+        break;
+      }
+      const chapter = this.chapterAtOffset(at);
+      const snippet = this.bookText
+        .slice(Math.max(0, at - 8), at + query.length + 24)
+        .replace(/\s+/g, ' ');
+      out.push({
+        kind: 'search',
+        chapter,
+        title: this.chapters[chapter] ? this.chapters[chapter].title : '',
+        snippet,
+        query,
+      });
+      from = at + Math.max(1, query.length);
+    }
+    return out;
+  }
+
+  /** 命中偏移属于第几章（chapters 按 start 升序） */
+  private chapterAtOffset(off: number): number {
+    let lo = 0;
+    let hi = this.chapters.length - 1;
+    let ans = 0;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const start = this.chapters[mid].start ?? 0;
+      if (start <= off) {
+        ans = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    return ans;
   }
 
   /** 跳到某章，并定位到首个包含指定文字的段落 */
@@ -1422,6 +1694,8 @@ export class NovelReaderView extends ItemView {
   private showEmptyState(): void {
     this.source = null;
     this.openPath = '';
+    this.bookText = null;
+    this.plainText = false;
     this.chapters = [];
     this.chaptersVersion += 1;
     this.chapterTexts = [];
@@ -1581,6 +1855,11 @@ class ReaderSearchModal extends FuzzySuggestModal<FindItem> {
     if (query.length === 0) {
       const marks = this.view.getBookmarks();
       return marks.map((item) => ({ kind: 'bookmark', item }) as BookSource2);
+    }
+    // 单文件大书：整本缓存里一次扫完，比逐章匹配快几个数量级
+    const direct = this.view.searchFullText(query, 60);
+    if (direct) {
+      return direct;
     }
     const lower = query.toLowerCase();
     const out: FindItem[] = [];
@@ -1808,25 +2087,46 @@ class TocModal extends Modal {
   public onOpen(): void {
     this.contentEl.addClass('nr-toc');
     this.titleEl.setText('目录');
-    let currentEl: HTMLElement | null = null;
-    for (let i = 0; i < this.entries.length; i++) {
-      const entry = this.entries[i];
-      const btn = this.contentEl.createEl('button', {
-        cls: `nr-toc-item nr-toc-l${Math.min(entry.level, 4)}`,
-        text: entry.label,
+    // 用对象装：闭包里赋值，TS 的控制流分析跟不到裸 let，会把类型收窄成 null
+    const state: { currentEl: HTMLElement | null } = { currentEl: null };
+    const list = this.contentEl.createDiv({ cls: 'nr-toc-list' });
+    let rendered = 0;
+    // 大书可能上千章，一次全渲染会卡住弹窗：分批渲染，剩下的点按钮追加
+    const moreBtn = this.contentEl.createEl('button', {
+      cls: 'nr-btn nr-toc-more',
+      text: '显示更多',
+    });
+    if (this.entries.length > TOC_PAGE) {
+      this.contentEl.createDiv({
+        cls: 'nr-shelf-hint',
+        text: `共 ${this.entries.length} 章，先显示前 ${TOC_PAGE} 章`,
       });
-      if (i === this.currentIndex) {
-        btn.addClass('nr-toc-current');
-        currentEl = btn;
-      }
-      btn.onclick = () => {
-        entry.onClick();
-        this.close();
-      };
     }
+    const renderMore = (): void => {
+      const end = Math.min(this.entries.length, rendered + TOC_PAGE);
+      for (let i = rendered; i < end; i++) {
+        const entry = this.entries[i];
+        const btn = list.createEl('button', {
+          cls: `nr-toc-item nr-toc-l${Math.min(entry.level, 4)}`,
+          text: entry.label,
+        });
+        if (i === this.currentIndex) {
+          btn.addClass('nr-toc-current');
+          state.currentEl = btn;
+        }
+        btn.onclick = () => {
+          entry.onClick();
+          this.close();
+        };
+      }
+      rendered = end;
+      moreBtn.style.display = rendered < this.entries.length ? '' : 'none';
+    };
+    moreBtn.onclick = () => renderMore();
+    renderMore();
     // 目录很长时把当前章滚到可见处
-    if (currentEl) {
-      const el = currentEl;
+    const el = state.currentEl;
+    if (el) {
       window.setTimeout(() => {
         try {
           el.scrollIntoView({ block: 'center' });
