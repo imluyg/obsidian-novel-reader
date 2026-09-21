@@ -2,13 +2,16 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.NovelReaderView = exports.NOVEL_READER_VIEW_TYPE = void 0;
 /**
- * Novel Reader — M1
- * 分页方案：CSS multi-column（column-fill: auto + 固定高），横向滚动按列翻页。
- * 进度 = 段落锚点（data-cid 序号）+ 全书百分比双保险，页码永不落盘。
+ * Novel Reader — M3
+ * 分页：CSS multi-column（column-fill: auto + 固定高），横向滚动按列翻页。
+ * 渲染：按章按需渲染，DOM 中只保留当前章节；单文件大书按标题切成虚拟章。
+ * 进度：（章节序号 + 段落锚点 + 章内页比例）三重冗余，页码永不落盘。
  * 移动端红线：不 import fs/path/electron；正则不使用 lookbehind；单文件构建。
  */
 const obsidian_1 = require("obsidian");
 exports.NOVEL_READER_VIEW_TYPE = 'novel-reader-view';
+/** 单文件大书无标题时，按此字数切虚拟章（在段落边界断开） */
+const CHUNK_SIZE = 8000;
 const GAP = 48;
 const FONT_MIN = 12;
 const FONT_MAX = 30;
@@ -171,7 +174,7 @@ function touchDistance(a, b) {
     const dy = a.clientY - b.clientY;
     return Math.sqrt(dx * dx + dy * dy);
 }
-/** 章节名启发式：用于文件夹书首次打开时的默认勾选。无 lookbehind。 */
+/** 章节名启发式：文件夹书首次打开时的默认勾选。无 lookbehind。 */
 function chapterLike(name) {
     if (/第.{0,4}[章節节卷回部集]/.test(name)) {
         return true;
@@ -181,11 +184,31 @@ function chapterLike(name) {
     }
     return /chapter/i.test(name);
 }
+/** 无标题的长文本按段落边界切成若干虚拟章 */
+function splitByLength(text, size) {
+    const out = [];
+    let start = 0;
+    let idx = 1;
+    while (start < text.length) {
+        if (text.length - start <= size) {
+            out.push({ title: `第 ${idx} 段`, start, end: text.length });
+            break;
+        }
+        const tail = text.slice(start, start + size);
+        const cut = Math.max(tail.lastIndexOf('\n\n'), tail.lastIndexOf('\n'));
+        const end = cut > size * 0.4 ? start + cut + 1 : start + size;
+        out.push({ title: `第 ${idx} 段`, start, end });
+        start = end;
+        idx += 1;
+    }
+    return out;
+}
 class NovelReaderView extends obsidian_1.ItemView {
     constructor(leaf, plugin) {
         super(leaf);
         this.source = null;
-        this.chapterFiles = [];
+        this.chapters = [];
+        this.chapterIndex = 0;
         this.viewportEl = null;
         this.pageEl = null;
         this.statusEl = null;
@@ -226,7 +249,7 @@ class NovelReaderView extends obsidian_1.ItemView {
             }
             const gone = (this.source.kind === 'file' && this.source.file.path === file.path) ||
                 (this.source.kind === 'folder' && this.source.folder.path === file.path) ||
-                this.chapterFiles.some((c) => c.path === file.path);
+                this.chapters.some((c) => c.file.path === file.path);
             if (gone) {
                 this.showEmptyState();
             }
@@ -238,6 +261,11 @@ class NovelReaderView extends obsidian_1.ItemView {
             if (this.source.kind === 'file' && this.source.file.path === oldPath) {
                 if (file instanceof obsidian_1.TFile) {
                     this.source = { kind: 'file', file };
+                    this.chapters.forEach((c) => {
+                        if (c.file.path === oldPath) {
+                            c.file = file;
+                        }
+                    });
                 }
                 else {
                     this.showEmptyState();
@@ -251,11 +279,6 @@ class NovelReaderView extends obsidian_1.ItemView {
                 else {
                     this.showEmptyState();
                 }
-                return;
-            }
-            const idx = this.chapterFiles.findIndex((c) => c.path === oldPath);
-            if (idx >= 0 && file instanceof obsidian_1.TFile) {
-                this.chapterFiles[idx] = file;
             }
         }));
         this.showEmptyState();
@@ -280,47 +303,20 @@ class NovelReaderView extends obsidian_1.ItemView {
         this.source = src;
         this.plugin.data.lastBook = this.sourceKey();
         this.plugin.saveSoon();
-        if (src.kind === 'folder') {
-            const all = listChapterFiles(src.folder);
-            if (all.length === 0) {
-                new obsidian_1.Notice('该文件夹没有 Markdown 文件');
-                this.showEmptyState();
-                return;
-            }
-            const cfg = this.plugin.data.bookConfig[src.folder.path];
-            let files;
-            if (cfg && cfg.files.length > 0) {
-                const wanted = new Set(cfg.files);
-                files = all.filter((f) => wanted.has(f.name));
-            }
-            else {
-                files = await pickChapters(this.app, src.folder, all);
-                if (files.length === 0) {
-                    this.showEmptyState();
-                    return;
-                }
-                this.plugin.data.bookConfig[src.folder.path] = { files: files.map((f) => f.name) };
-                this.plugin.saveSoon();
-            }
-            this.chapterFiles = files;
+        const files = src.kind === 'file' ? [src.file] : await this.resolveFolderChapters(src.folder);
+        if (files.length === 0) {
+            this.showEmptyState();
+            return;
         }
-        else {
-            this.chapterFiles = [src.file];
+        this.chapters = await this.buildChapters(files);
+        if (this.chapters.length === 0) {
+            new obsidian_1.Notice('这本书没有可渲染的内容');
+            this.showEmptyState();
+            return;
         }
         this.contentEl.empty();
         this.contentEl.addClass('novel-reader');
         this.buildShell();
-        this.cidEls = [];
-        let cid = 0;
-        for (const file of this.chapterFiles) {
-            const chapterEl = this.pageEl.createDiv({ cls: 'nr-chapter' });
-            const text = await this.app.vault.cachedRead(file);
-            await obsidian_1.MarkdownRenderer.render(this.app, text, chapterEl, file.path, this);
-            for (const el of Array.from(chapterEl.children)) {
-                el.dataset.cid = String(cid++);
-                this.cidEls.push(el);
-            }
-        }
         this.applySettings();
         this.applyImmersive();
         this.ro = new ResizeObserver(() => {
@@ -328,8 +324,62 @@ class NovelReaderView extends obsidian_1.ItemView {
         });
         this.ro.observe(this.viewportEl);
         const progress = this.plugin.data.books[this.sourceKey()];
-        this.relayout(progress || { cid: 0, percent: 0 });
-        this.saveProgressNow();
+        const index = progress
+            ? Math.min(this.chapters.length - 1, Math.max(0, progress.chapter))
+            : 0;
+        const target = progress
+            ? { cid: progress.cid, percent: progress.percent }
+            : { page: 0 };
+        await this.loadChapter(index, target);
+    }
+    /** 文件夹书：按已保存的章节配置过滤，首次打开弹勾选框 */
+    async resolveFolderChapters(folder) {
+        const all = listChapterFiles(folder);
+        if (all.length === 0) {
+            new obsidian_1.Notice('该文件夹没有 Markdown 文件');
+            return [];
+        }
+        const cfg = this.plugin.data.bookConfig[folder.path];
+        if (cfg && cfg.files.length > 0) {
+            const wanted = new Set(cfg.files);
+            return all.filter((f) => wanted.has(f.name));
+        }
+        const picked = await pickChapters(this.app, folder, all);
+        if (picked.length === 0) {
+            return [];
+        }
+        this.plugin.data.bookConfig[folder.path] = { files: picked.map((f) => f.name) };
+        this.plugin.saveSoon();
+        return picked;
+    }
+    /** 构建章节列表：文件夹=每文件一章；单文件=按标题切虚拟章，无标题则按字数切 */
+    async buildChapters(files) {
+        const chapters = [];
+        if (this.source && this.source.kind === 'folder') {
+            for (const file of files) {
+                chapters.push({ file, title: file.basename, level: 1 });
+            }
+            return chapters;
+        }
+        const file = files[0];
+        const text = await this.app.vault.cachedRead(file);
+        const cache = this.app.metadataCache.getFileCache(file);
+        const headings = (cache && cache.headings) || [];
+        if (headings.length >= 2) {
+            for (let i = 0; i < headings.length; i++) {
+                const start = headings[i].position.start.offset;
+                const end = i + 1 < headings.length ? headings[i + 1].position.start.offset : text.length;
+                chapters.push({ file, title: headings[i].heading, level: headings[i].level, start, end });
+            }
+            return chapters;
+        }
+        for (const chunk of splitByLength(text, CHUNK_SIZE)) {
+            chapters.push({ file, title: chunk.title, level: 1, start: chunk.start, end: chunk.end });
+        }
+        if (chapters.length === 0) {
+            chapters.push({ file, title: file.basename, level: 1 });
+        }
+        return chapters;
     }
     sourceKey() {
         if (!this.source) {
@@ -343,6 +393,7 @@ class NovelReaderView extends obsidian_1.ItemView {
         }
         return this.source.kind === 'file' ? this.source.file.basename : this.source.folder.name;
     }
+    /* ---------- 界面骨架与交互 ---------- */
     buildShell() {
         this.viewportEl = this.contentEl.createDiv({ cls: 'novel-reader-viewport' });
         this.pageEl = this.viewportEl.createDiv({ cls: 'nr-page' });
@@ -451,7 +502,6 @@ class NovelReaderView extends obsidian_1.ItemView {
         this.themeBtnEl = mkBtn(this.themeLabel(), () => this.cycleTheme());
         mkBtn(this.immersiveLabel(), () => this.toggleImmersive());
         mkBtn('目录', () => this.openToc());
-        mkBtn('章节', () => this.repickChapters());
         mkBtn('换书', () => {
             this.toggleSheet(false);
             this.plugin.openPicker(this);
@@ -464,13 +514,20 @@ class NovelReaderView extends obsidian_1.ItemView {
         const show = force !== undefined ? force : !this.sheetEl.hasClass('nr-open');
         this.sheetEl.toggleClass('nr-open', show);
     }
+    /* ---------- 排版与主题 ---------- */
     changeFont(delta) {
         const s = this.plugin.data.settings;
         s.fontSize = Math.min(FONT_MAX, Math.max(FONT_MIN, s.fontSize + delta));
         this.plugin.saveSoon();
         this.reflow();
     }
-    /** 捏合过程中实时应用字号（rAF 节流重排，结束时机由 touchend 落盘） */
+    changeLineHeight(delta) {
+        const s = this.plugin.data.settings;
+        s.lineHeight = Math.min(LH_MAX, Math.max(LH_MIN, Math.round((s.lineHeight + delta) * 10) / 10));
+        this.plugin.saveSoon();
+        this.reflow();
+    }
+    /** 捏合过程中实时应用字号（rAF 节流重排，抬手时才落盘） */
     applyFontSizeLive(size) {
         const s = this.plugin.data.settings;
         if (s.fontSize === size) {
@@ -485,12 +542,6 @@ class NovelReaderView extends obsidian_1.ItemView {
             this.pinchRaf = 0;
             this.reflow();
         });
-    }
-    changeLineHeight(delta) {
-        const s = this.plugin.data.settings;
-        s.lineHeight = Math.min(LH_MAX, Math.max(LH_MIN, Math.round((s.lineHeight + delta) * 10) / 10));
-        this.plugin.saveSoon();
-        this.reflow();
     }
     cycleTheme() {
         const order = ['auto', 'sepia', 'dark'];
@@ -524,6 +575,11 @@ class NovelReaderView extends obsidian_1.ItemView {
     applyImmersive() {
         document.body.toggleClass('nr-immersive', this.plugin.data.settings.immersive && !!this.source);
     }
+    applyTheme() {
+        const theme = this.plugin.data.settings.theme;
+        this.contentEl.toggleClass('nr-sepia', theme === 'sepia');
+        this.contentEl.toggleClass('nr-dark', theme === 'dark');
+    }
     applySettings() {
         const s = this.plugin.data.settings;
         this.contentEl.style.setProperty('--nr-font', `${s.fontSize}px`);
@@ -533,25 +589,89 @@ class NovelReaderView extends obsidian_1.ItemView {
         }
         this.applyTheme();
     }
-    applyTheme() {
-        const theme = this.plugin.data.settings.theme;
-        this.contentEl.toggleClass('nr-sepia', theme === 'sepia');
-        this.contentEl.toggleClass('nr-dark', theme === 'dark');
+    /* ---------- 章节渲染与分页 ---------- */
+    async loadChapter(index, target) {
+        if (!this.pageEl || this.chapters.length === 0) {
+            return;
+        }
+        this.chapterIndex = Math.min(this.chapters.length - 1, Math.max(0, index));
+        const chapter = this.chapters[this.chapterIndex];
+        let md = await this.app.vault.cachedRead(chapter.file);
+        if (chapter.start !== undefined && chapter.end !== undefined) {
+            md = md.slice(chapter.start, chapter.end);
+        }
+        this.pageEl.empty();
+        const holder = this.pageEl.createDiv({ cls: 'nr-chapter' });
+        await obsidian_1.MarkdownRenderer.render(this.app, md, holder, chapter.file.path, this);
+        this.cidEls = [];
+        let cid = 0;
+        for (const el of Array.from(holder.children)) {
+            el.dataset.cid = String(cid++);
+            this.cidEls.push(el);
+        }
+        this.relayout(undefined, target);
+        this.saveProgressNow();
     }
     reflow() {
         this.relayout(this.currentAnchor());
     }
-    /** 重算分页并回到锚点（字号/行距/窗口尺寸变化后调用） */
-    relayout(anchor) {
+    /** 重算分页并定位：anchor 用于重排（保持当前位置），target 用于章节加载后的跳转 */
+    relayout(anchor, target) {
         if (!this.viewportEl || !this.pageEl) {
             return;
         }
         this.pageEl.style.columnWidth = `${this.viewportEl.clientWidth}px`;
         this.pageCount = Math.max(1, Math.ceil(this.pageEl.scrollWidth / this.stride()));
-        this.restorePosition(anchor);
+        if (target) {
+            this.restoreTarget(target);
+        }
+        else if (anchor) {
+            this.restoreAnchor(anchor);
+        }
+        this.updateStatus();
+    }
+    restoreAnchor(anchor) {
+        if (!this.viewportEl) {
+            return;
+        }
+        const el = anchor.cid >= 0 && anchor.cid < this.cidEls.length ? this.cidEls[anchor.cid] : undefined;
+        if (el) {
+            const col = Math.floor(this.contentX(el) / this.stride());
+            this.viewportEl.scrollTo({ left: Math.max(0, col) * this.stride() });
+            return;
+        }
+        this.viewportEl.scrollTo({ left: anchor.percent * this.maxScroll() });
+    }
+    restoreTarget(target) {
+        if (!this.viewportEl) {
+            return;
+        }
+        if (target.last) {
+            this.viewportEl.scrollTo({ left: (this.pageCount - 1) * this.stride() });
+            return;
+        }
+        const el = target.cid !== undefined && target.cid >= 0 && target.cid < this.cidEls.length
+            ? this.cidEls[target.cid]
+            : undefined;
+        if (el) {
+            const col = Math.floor(this.contentX(el) / this.stride());
+            this.viewportEl.scrollTo({ left: Math.max(0, col) * this.stride() });
+            return;
+        }
+        if (target.percent !== undefined && target.percent > 0) {
+            this.viewportEl.scrollTo({ left: target.percent * this.maxScroll() });
+            return;
+        }
+        this.viewportEl.scrollTo({ left: (target.page || 0) * this.stride() });
     }
     stride() {
         return (this.viewportEl ? this.viewportEl.clientWidth : 0) + GAP;
+    }
+    maxScroll() {
+        if (!this.viewportEl || !this.pageEl) {
+            return 1;
+        }
+        return Math.max(1, this.pageEl.scrollWidth - this.viewportEl.clientWidth);
     }
     contentX(el) {
         if (!this.viewportEl || !this.pageEl) {
@@ -561,33 +681,35 @@ class NovelReaderView extends obsidian_1.ItemView {
             this.viewportEl.scrollLeft -
             this.pageEl.getBoundingClientRect().left);
     }
-    restorePosition(anchor) {
-        if (!this.viewportEl || !this.pageEl) {
-            return;
+    currentPageIndex() {
+        if (!this.viewportEl) {
+            return 0;
         }
-        const el = anchor.cid >= 0 && anchor.cid < this.cidEls.length ? this.cidEls[anchor.cid] : undefined;
-        if (el) {
-            const col = Math.floor(this.contentX(el) / this.stride());
-            this.viewportEl.scrollTo({ left: Math.max(0, col) * this.stride() });
-        }
-        else if (anchor.percent > 0) {
-            const max = Math.max(1, this.pageEl.scrollWidth - this.viewportEl.clientWidth);
-            this.viewportEl.scrollTo({ left: anchor.percent * max });
-        }
-        this.updateStatus();
+        return Math.max(0, Math.round(this.viewportEl.scrollLeft / this.stride()));
     }
     turnPage(dir) {
         if (!this.viewportEl) {
             return;
         }
         this.toggleSheet(false);
-        const current = Math.round(this.viewportEl.scrollLeft / this.stride());
-        const target = Math.min(this.pageCount - 1, Math.max(0, current + dir));
+        const target = this.currentPageIndex() + dir;
+        if (target < 0) {
+            if (this.chapterIndex > 0) {
+                void this.loadChapter(this.chapterIndex - 1, { last: true });
+            }
+            return;
+        }
+        if (target >= this.pageCount) {
+            if (this.chapterIndex < this.chapters.length - 1) {
+                void this.loadChapter(this.chapterIndex + 1, { page: 0 });
+            }
+            return;
+        }
         this.viewportEl.scrollTo({ left: target * this.stride(), behavior: 'smooth' });
     }
     currentAnchor() {
-        if (!this.viewportEl || !this.pageEl) {
-            return { cid: 0, percent: 0 };
+        if (!this.viewportEl) {
+            return { chapter: this.chapterIndex, cid: 0, percent: 0 };
         }
         const edge = this.viewportEl.scrollLeft + 2;
         let cid = 0;
@@ -599,96 +721,41 @@ class NovelReaderView extends obsidian_1.ItemView {
                 break;
             }
         }
-        const max = Math.max(1, this.pageEl.scrollWidth - this.viewportEl.clientWidth);
-        const percent = Math.min(1, Math.max(0, this.viewportEl.scrollLeft / max));
-        return { cid, percent };
+        const percent = Math.min(1, Math.max(0, this.viewportEl.scrollLeft / this.maxScroll()));
+        return { chapter: this.chapterIndex, cid, percent };
     }
     saveProgressNow() {
-        if (!this.source || !this.viewportEl || !this.pageEl) {
+        if (!this.source || !this.viewportEl) {
             return;
         }
         this.plugin.data.books[this.sourceKey()] = this.currentAnchor();
         this.plugin.saveSoon();
     }
     updateStatus() {
-        if (!this.statusEl || !this.viewportEl) {
+        if (!this.statusEl) {
             return;
         }
-        const idx = Math.min(this.pageCount, Math.round(this.viewportEl.scrollLeft / this.stride()) + 1);
-        const percent = Math.round((idx / this.pageCount) * 100);
-        this.statusEl.setText(`${this.bookTitle()} · ${idx} / ${this.pageCount} 页 · ${percent}%`);
+        const page = Math.min(this.pageCount, this.currentPageIndex() + 1);
+        const totalChapters = Math.max(1, this.chapters.length);
+        const overall = Math.round(((this.chapterIndex + page / this.pageCount) / totalChapters) * 100);
+        this.statusEl.setText(`${this.bookTitle()} · 第 ${this.chapterIndex + 1}/${totalChapters} 章 · ${page}/${this.pageCount} 页 · ${overall}%`);
     }
     openToc() {
-        const entries = [];
-        if (!this.source) {
+        if (this.chapters.length === 0) {
             return;
         }
-        if (this.source.kind === 'folder') {
-            const chapterEls = this.pageEl ? Array.from(this.pageEl.children) : [];
-            this.chapterFiles.forEach((file, i) => {
-                const el = chapterEls[i];
-                if (el) {
-                    entries.push({
-                        label: file.basename,
-                        level: 1,
-                        onClick: () => this.jumpToElement(el),
-                    });
-                }
-            });
-        }
-        else {
-            const cache = this.app.metadataCache.getFileCache(this.source.file);
-            const headings = (cache && cache.headings) || [];
-            const headingEls = this.pageEl
-                ? Array.from(this.pageEl.querySelectorAll('h1,h2,h3,h4,h5,h6'))
-                : [];
-            if (headings.length === headingEls.length && headings.length > 0) {
-                headings.forEach((h, i) => {
-                    entries.push({
-                        label: h.heading,
-                        level: h.level,
-                        onClick: () => this.jumpToElement(headingEls[i]),
-                    });
-                });
-            }
-            else {
-                headingEls.forEach((el) => {
-                    entries.push({
-                        label: el.getText(),
-                        level: 1,
-                        onClick: () => this.jumpToElement(el),
-                    });
-                });
-            }
-        }
-        if (entries.length === 0) {
-            new obsidian_1.Notice('本书没有可用的目录');
-            return;
-        }
-        new TocModal(this.app, entries).open();
-    }
-    jumpToElement(el) {
-        if (!this.viewportEl) {
-            return;
-        }
-        const col = Math.floor(this.contentX(el) / this.stride());
-        this.viewportEl.scrollTo({ left: Math.max(0, col) * this.stride(), behavior: 'smooth' });
-    }
-    /** 文件夹书重新勾选章节 */
-    repickChapters() {
-        if (!this.source || this.source.kind !== 'folder') {
-            new obsidian_1.Notice('只有文件夹书可以重新选择章节');
-            return;
-        }
-        const folder = this.source.folder;
-        delete this.plugin.data.bookConfig[folder.path];
-        this.plugin.saveSoon();
+        const entries = this.chapters.map((chapter, i) => ({
+            label: chapter.title,
+            level: chapter.level,
+            onClick: () => void this.loadChapter(i, { page: 0 }),
+        }));
         this.toggleSheet(false);
-        void this.openSource({ kind: 'folder', folder });
+        new TocModal(this.app, entries).open();
     }
     showEmptyState() {
         this.source = null;
-        this.chapterFiles = [];
+        this.chapters = [];
+        this.chapterIndex = 0;
         this.cidEls = [];
         this.pageCount = 1;
         document.body.removeClass('nr-immersive');
@@ -716,12 +783,6 @@ function listChapterFiles(folder) {
 function pickChapters(app, folder, files) {
     return new Promise((resolve) => {
         let done = false;
-        const finish = (picked) => {
-            if (!done) {
-                done = true;
-                resolve(picked);
-            }
-        };
         const modal = new obsidian_1.Modal(app);
         modal.titleEl.setText(`选择《${folder.name}》的章节`);
         const listEl = modal.contentEl.createDiv({ cls: 'nr-pick-list' });
@@ -747,7 +808,10 @@ function pickChapters(app, folder, files) {
             modal.close();
         };
         modal.onClose = () => {
-            finish(files.filter((_, i) => checks[i].checked));
+            if (!done) {
+                done = true;
+                resolve(files.filter((_, i) => checks[i].checked));
+            }
         };
         modal.open();
     });
